@@ -43,6 +43,12 @@ typedef struct {
 } registers_t;
 
 
+typedef struct {
+    uint32_t v1;
+    uint32_t v2;
+    uint32_t v3;
+} ProtectedInt;
+
 /* --- IDT Structures (Same as before) --- */
 struct idt_entry_t {
     uint16_t offset_low;
@@ -71,7 +77,19 @@ uint16_t make_vgaentry(char c, uint8_t color) {
     return c16 | (color16 << 8);
 }
 
+void write_safe(ProtectedInt* p, uint32_t value) {
+    p->v1 = value;
+    p->v2 = value;
+    p->v3 = value;
+}
 
+uint32_t read_safe(ProtectedInt* p) {
+    if (p->v1 == p->v2 && p->v2 == p->v3) return p->v1;
+    if (p->v2 == p->v3) { p->v1 = p->v2; return p->v2; }
+    if (p->v1 == p->v3) { p->v2 = p->v1; return p->v1; }
+    if (p->v1 == p->v2) { p->v3 = p->v1; return p->v1; }
+    return p->v1; 
+}
 
 
 void print_hex(uint32_t n) {
@@ -107,52 +125,37 @@ void print_str(const char* str) {
     }
 }
 
-
-/* --- The "Blue Screen" Handler (Updated) --- */
-void fault_handler(registers_t regs) {
-    if (regs.int_no < 32) {
-        
-        // 1. Paint background Red
-        for (int i = 0; i < 80*25; i++) {
-             vga_buffer[i] = make_vgaentry(' ', make_color(15, 4));
-        }
-
-        // Reset cursor for printing
-        cursor_x = 0; 
-        cursor_y = 2; // Start a bit down
-
-        // 2. Print Error Description
-        print_str("FATAL EXCEPTION RECEIVED!");
-        print_newline();
+/* Update signature to take a POINTER */
+void fault_handler(registers_t* regs) {
+    
+    // Tactic 1: Handle Divide by Zero (INT 0)
+    if (regs->int_no == 0) {
+        // 1. Notify (Optional - can be silent in production)
+        print_str("[FALCON] Div-by-Zero detected! Patching...");
         print_newline();
 
-        // 3. Dump Register Information
-        print_str("INTERRUPT NO: ");
-        print_hex(regs.int_no);
-        print_newline();
+        // 2. THE FIX: Skip the bad instruction.
+        // Most 'div' instructions are 2 or 3 bytes long.
+        // This is a heuristic. In a real OS, we would decode the instruction.
+        // For 'div eax' (F7 F0) or similar, 2 bytes is a safe bet for this demo.
+        regs->eip += 2; 
 
-        print_str("ERROR CODE:   ");
-        print_hex(regs.err_code);
-        print_newline();
+        // 3. THE SANITIZATION:
+        // Since the division failed, EAX (the result) contains garbage.
+        // Let's force it to 0 so the program logic usually continues safely.
+        regs->eax = 0;
 
-        // EIP = Instruction Pointer (THE MOST IMPORTANT ONE)
-        // This tells us exactly which instruction caused the crash.
-        print_str("EIP (Loc):    ");
-        print_hex(regs.eip); 
-        print_newline();
+        // 4. Return immediately! Do not halt.
+        return; 
+    }
 
-        print_str("EFLAGS:       ");
-        print_hex(regs.eflags);
-        print_newline();
-
-        // 4. Halt
-        print_newline();
-        print_str("SYSTEM HALTED. PLEASE RESTART.");
-        
+    // Tactic 2: Handle all other crashes
+    if (regs->int_no < 32) {
+        // ... (קוד המסך האדום הרגיל שלך כאן) ...
+        print_str("FATAL UNRECOVERABLE ERROR");
         asm volatile("cli; hlt");
     }
 }
-
 /* --- Low Level I/O Functions --- */
 
 /* Write a byte to a hardware port */
@@ -249,33 +252,55 @@ void init_interrupts()
 
 /* --- Main --- */
 void kmain(void) {
-    // Clear screen
-    for (int i = 0; i < 80*25; i++) {
-        vga_buffer[i] = make_vgaentry(' ', make_color(15, 1));
-    }
-
-    // Title
-    vga_buffer[38] = make_vgaentry('F', make_color(10, 1));
-    vga_buffer[39] = make_vgaentry('A', make_color(10, 1));
-    vga_buffer[40] = make_vgaentry('L', make_color(10, 1));
-    vga_buffer[41] = make_vgaentry('C', make_color(10, 1));
-    vga_buffer[42] = make_vgaentry('O', make_color(10, 1));
-    vga_buffer[43] = make_vgaentry('N', make_color(10, 1));
-
-    // Setup Nervous System
+    // ... init code ...
     init_idt();
+    asm volatile("int $1");
     init_interrupts();
-    // Link the Assembly wrapper to Interrupt 32 (Timer)
-    extern void timer_wrapper();
-    idt_set_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);
-    asm volatile("int $0x01");
-    // Initialize Hardware
-    init_timer();
-
-    // ENABLE INTERRUPTS (The moment of truth)
-    // 'sti' = Set Interrupt Flag
     asm volatile("sti");
 
-    // Infinite loop - The CPU will now jump to timer_handler automatically
+    /* --- SCENARIO: THE INDESTRUCTIBLE SYSTEM --- */
+
+    // 1. Setup Critical Data (TMR)
+    ProtectedInt fuel_level;
+    write_safe(&fuel_level, 100); // 100% Fuel
+
+    print_str("System check... Fuel at 100%");
+    print_newline();
+
+    // 2. ATTACK 1: Memory Corruption
+    // A cosmic ray hits memory!
+    fuel_level.v2 = 99999; 
+    
+    // Validate TMR works
+    uint32_t current_fuel = read_safe(&fuel_level);
+    if (current_fuel == 100) {
+        print_str("Memory Corruption Detected & Repaired automatically.");
+        print_newline();
+    } else {
+        print_str("Memory Repair Failed!"); // Should not happen
+    }
+
+    // 3. ATTACK 2: Logic Crash (Divide by Zero)
+    print_str("Attempting illegal calculation...");
+    print_newline();
+    
+    int a = 10;
+    int b = 0;
+    int result;
+    
+    // This generates a 'div' instruction that normally kills the PC
+    // But our new handler should catch it, print a message, and set result to 0.
+    asm volatile (
+        "div %2"
+        : "=a"(result) 
+        : "a"(a), "r"(b) // EAX=10, divisor=0
+    );
+
+    // If we get here, we survived the crash!
+    print_str("I AM STILL ALIVE!");
+    print_newline();
+    print_str("Result fixed to: ");
+    print_hex(result); // Should be 0 (our manual fix)
+
     while(1);
 }

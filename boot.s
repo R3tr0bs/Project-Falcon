@@ -72,32 +72,34 @@ ISR_NOERRCODE 15  ; Reserved
 
 
 isr_common_stub:
-    pushad          ; 1. Pushes edi, esi, ebp, esp, ebx, edx, ecx, eax
-
-    mov ax, ds      ; 2. Save the Data Segment descriptor
+    pushad          ; Save general registers
+    
+    mov ax, ds      ; Save DS
     push eax
 
-    mov ax, 0x10    ; 3. Load the Kernel Data Segment descriptor
+    mov ax, 0x10    ; Load Kernel DS
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
 
-    call fault_handler ; 4. Call the high-level C code
+    ; --- CHANGE HERE ---
+    push esp           ; Pass a POINTER to the registers as an argument
+    call fault_handler
+    add esp, 4         ; Clean up the pointer argument
+    ; -------------------
 
-    pop eax         ; 5. Restore the original Data Segment
+    pop eax         ; Restore DS
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
 
-    popad           ; 6. Restore general purpose registers
+    popad           ; Restore general registers
+    add esp, 8      ; Clean up error code and ISR number
+    iretd
 
-    add esp, 8      ; 7. Clean up the pushed error code and ISR number
-                    ;    (We pushed 2 dwords = 8 bytes)
     
-    iretd           ; 8. Return from interrupt
-
 ; This is the bridge between hardware and C code
 timer_wrapper:
     pushad             ; 1. Save all general purpose registers
