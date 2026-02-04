@@ -27,6 +27,11 @@ extern void isr13();
 extern void isr14();
 extern void isr15();
 
+/* --- Helper: Print Hexadecimal Value --- */
+/* Prints a 32-bit number in hex format (e.g., 0x0001F4A) at the current cursor location */
+int cursor_x = 0;
+int cursor_y = 0;
+
 /* --- CPU State Structure --- */
 /* This struct maps exactly to the stack layout created by 'isr_common_stub' */
 typedef struct {
@@ -66,28 +71,84 @@ uint16_t make_vgaentry(char c, uint8_t color) {
     return c16 | (color16 << 8);
 }
 
-/* --- The "Blue Screen" Handler --- */
+
+
+
+void print_hex(uint32_t n) {
+    const char *hex_chars = "0123456789ABCDEF";
+    
+    // Print "0x" prefix
+    vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry('0', make_color(15, 4));
+    vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry('x', make_color(15, 4));
+
+    // Loop through 8 nibbles (4 bits each) because 32 bits / 4 = 8 chars
+    for (int i = 28; i >= 0; i -= 4) {
+        // Extract the nibble
+        uint8_t nibble = (n >> i) & 0xF; 
+        
+        // Print the character
+        vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry(hex_chars[nibble], make_color(15, 4));
+    }
+    
+    // Add a space after the number
+    cursor_x++; 
+}
+
+/* Helper to move to next line */
+void print_newline() {
+    cursor_x = 0;
+    cursor_y++;
+}
+
+/* Helper to print a string */
+void print_str(const char* str) {
+    for(int i=0; str[i] != 0; i++) {
+        vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry(str[i], make_color(15, 4));
+    }
+}
+
+
+/* --- The "Blue Screen" Handler (Updated) --- */
 void fault_handler(registers_t regs) {
-    // If interrupt is less than 32, it is a CPU Exception (Crash)
     if (regs.int_no < 32) {
         
-        // 1. Clear screen or change background color to Red (Panic)
-        // (Assuming you have a clear_screen function, otherwise just overwrite vga)
-        volatile uint16_t* vga = (uint16_t*)0xB8000;
+        // 1. Paint background Red
         for (int i = 0; i < 80*25; i++) {
-             vga[i] = make_vgaentry(' ', make_color(15, 4)); // White on Red
+             vga_buffer[i] = make_vgaentry(' ', make_color(15, 4));
         }
 
-        // 2. Display Error Message (Basic implementation)
-        const char* msg = "KERNEL PANIC: CPU EXCEPTION DETECTED!";
-        for(int i=0; msg[i] != 0; i++) {
-            vga[i] = make_vgaentry(msg[i], make_color(15, 4));
-        }
+        // Reset cursor for printing
+        cursor_x = 0; 
+        cursor_y = 2; // Start a bit down
 
-        // TODO: Print the specific Interrupt Number (regs.int_no) to know WHAT happened
-        // TODO: Print the EIP (regs.eip) to know WHERE it happened
+        // 2. Print Error Description
+        print_str("FATAL EXCEPTION RECEIVED!");
+        print_newline();
+        print_newline();
 
-        // 3. Halt the system completely to prevent further damage
+        // 3. Dump Register Information
+        print_str("INTERRUPT NO: ");
+        print_hex(regs.int_no);
+        print_newline();
+
+        print_str("ERROR CODE:   ");
+        print_hex(regs.err_code);
+        print_newline();
+
+        // EIP = Instruction Pointer (THE MOST IMPORTANT ONE)
+        // This tells us exactly which instruction caused the crash.
+        print_str("EIP (Loc):    ");
+        print_hex(regs.eip); 
+        print_newline();
+
+        print_str("EFLAGS:       ");
+        print_hex(regs.eflags);
+        print_newline();
+
+        // 4. Halt
+        print_newline();
+        print_str("SYSTEM HALTED. PLEASE RESTART.");
+        
         asm volatile("cli; hlt");
     }
 }
@@ -207,14 +268,14 @@ void kmain(void) {
     // Link the Assembly wrapper to Interrupt 32 (Timer)
     extern void timer_wrapper();
     idt_set_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);
-
+    asm volatile("int $0x01");
     // Initialize Hardware
     init_timer();
 
     // ENABLE INTERRUPTS (The moment of truth)
     // 'sti' = Set Interrupt Flag
     asm volatile("sti");
-    asm volatile("int $0x1");
+
     // Infinite loop - The CPU will now jump to timer_handler automatically
     while(1);
 }
