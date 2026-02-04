@@ -254,7 +254,6 @@ void init_interrupts()
 void kmain(void) {
     // ... init code ...
     init_idt();
-    asm volatile("int $1");
     init_interrupts();
     asm volatile("sti");
 
