@@ -1,55 +1,62 @@
-/* kernel.c - Project Falcon Phase 3: The Heartbeat */
+/**
+ * @file kernel.c
+ * @brief Project Falcon's Simple Kernel
+ *
+ * This file contains the C part of the kernel, including the entry point `kmain`.
+ * It handles interrupt setup, basic hardware drivers (VGA, keyboard), and a
+ * simple command-line shell.
+ *
+ * Architecture:
+ *  - kmain: Initializes all subsystems and enters an infinite loop.
+ *  - Interrupts: CPU exceptions and hardware IRQs are handled.
+ *    - The PIC is remapped to avoid conflicts with CPU exceptions.
+ *    - The IDT is populated with ISRs (Interrupt Service Routines).
+ *    - C handlers are implemented for CPU faults, the timer, and the keyboard.
+ *  - Drivers:
+ *    - VGA: Simple, direct-write text-mode output.
+ *    - Keyboard: Reads scancodes, translates them, and buffers them for the shell.
+ *  - Shell: A simple command interpreter for basic OS interaction.
+ */
+
 #include <stdint.h>
 
-/* --- Hardware Communication Ports --- */
+//==============================================================================
+// SECTION: CONSTANTS AND GLOBALS
+//==============================================================================
+
+// --- Hardware I/O Ports ---
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA    0x21
 #define PIC2_COMMAND 0xA0
 #define PIC2_DATA    0xA1
+#define KBD_DATA_PORT 0x60
 
-/* --- VGA Text Mode Definitions --- */
+// --- Kernel Configuration ---
+#define CMD_BUFFER_SIZE 256
+#define VGA_WIDTH 80
+#define VGA_HEIGHT 25
+
+// --- Global Variables ---
+// VGA buffer starts at this memory address in text mode.
 volatile uint16_t* vga_buffer = (uint16_t*)0xB8000;
-extern void timer_wrapper(void);
-extern void isr0();
-extern void isr1();
-extern void isr2();
-extern void isr3();
-extern void isr4();
-extern void isr5();
-extern void isr6();
-extern void isr7();
-extern void isr8();
-extern void isr9();
-extern void isr10();
-extern void isr11();
-extern void isr12();
-extern void isr13();
-extern void isr14();
-extern void isr15();
-
-/* --- Helper: Print Hexadecimal Value --- */
-/* Prints a 32-bit number in hex format (e.g., 0x0001F4A) at the current cursor location */
+// Current cursor position.
 int cursor_x = 0;
 int cursor_y = 0;
+// Buffer to hold command line input.
+char cmd_buffer[CMD_BUFFER_SIZE];
+int cmd_buffer_idx = 0;
 
-/* --- CPU State Structure --- */
-/* This struct maps exactly to the stack layout created by 'isr_common_stub' */
+// --- CPU State (for fault handling) ---
+// This struct maps to the stack layout created by 'isr_common_stub' in boot.s.
 typedef struct {
     uint32_t ds;                                     // Data segment selector
     uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax; // Pushed by pushad
     uint32_t int_no;                                 // Interrupt number
-    uint32_t err_code;                               // Error code (or dummy)
+    uint32_t err_code;                               // Error code (or dummy value)
     uint32_t eip, cs, eflags, useresp, ss;           // Pushed by the processor automatically
 } registers_t;
 
-
-typedef struct {
-    uint32_t v1;
-    uint32_t v2;
-    uint32_t v3;
-} ProtectedInt;
-
-/* --- IDT Structures (Same as before) --- */
+// --- IDT Structures ---
 struct idt_entry_t {
     uint16_t offset_low;
     uint16_t selector;
@@ -67,103 +74,152 @@ struct idt_entry_t idt[256];
 struct idt_ptr_t idt_ptr;
 
 
+//==============================================================================
+// SECTION: ASSEMBLY FUNCTION PROTOTYPES
+//==============================================================================
+// These wrappers are defined in boot.s. They form the bridge between
+// a hardware/CPU interrupt and its C handler.
+
+extern void timer_wrapper(void);
+extern void keyboard_wrapper(void);
+
+// CPU Exception ISRs
+extern void isr0(); extern void isr1(); extern void isr2(); extern void isr3();
+extern void isr4(); extern void isr5(); extern void isr6(); extern void isr7();
+extern void isr8(); extern void isr9(); extern void isr10(); extern void isr11();
+extern void isr12(); extern void isr13(); extern void isr14(); extern void isr15();
+
+
+//==============================================================================
+// SECTION: FORWARD DECLARATIONS OF C FUNCTIONS
+//==============================================================================
+void process_command(char* command);
+void print_newline();
+
+
+//==============================================================================
+// SECTION: UTILITY FUNCTIONS
+//==============================================================================
+
+/**
+ * @brief Compares two null-terminated strings.
+ * @return 0 if strings are identical, non-zero otherwise.
+ */
+int strcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+/**
+ * @brief Compares the first n bytes of two strings.
+ * @return 0 if strings are identical up to n chars, non-zero otherwise.
+ */
+int strncmp(const char* s1, const char* s2, int n) {
+    while (n && *s1 && (*s1 == *s2)) {
+        --n;
+        s1++;
+        s2++;
+    }
+    if (n == 0) {
+        return 0;
+    } else {
+        return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+    }
+}
+
+
+//==============================================================================
+// SECTION: LOW-LEVEL I/O
+//==============================================================================
+
+/**
+ * @brief Writes a byte to the specified hardware port.
+ */
+void outb(uint16_t port, uint8_t val) {
+    asm volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
+}
+
+/**
+ * @brief Reads a byte from the specified hardware port.
+ * @return The byte value read from the port.
+ */
+uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    asm volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) );
+    return ret;
+}
+
+
+//==============================================================================
+// SECTION: VGA TEXT MODE DRIVER
+//==============================================================================
+
+/**
+ * @brief Creates a VGA color attribute byte.
+ */
 uint8_t make_color(uint8_t fg, uint8_t bg) {
     return (bg << 4) | fg;
 }
 
+/**
+ * @brief Creates a 16-bit VGA buffer entry.
+ */
 uint16_t make_vgaentry(char c, uint8_t color) {
     uint16_t c16 = c;
     uint16_t color16 = color;
     return c16 | (color16 << 8);
 }
 
-void write_safe(ProtectedInt* p, uint32_t value) {
-    p->v1 = value;
-    p->v2 = value;
-    p->v3 = value;
-}
-
-uint32_t read_safe(ProtectedInt* p) {
-    if (p->v1 == p->v2 && p->v2 == p->v3) return p->v1;
-    if (p->v2 == p->v3) { p->v1 = p->v2; return p->v2; }
-    if (p->v1 == p->v3) { p->v2 = p->v1; return p->v1; }
-    if (p->v1 == p->v2) { p->v3 = p->v1; return p->v1; }
-    return p->v1; 
-}
-
-
-void print_hex(uint32_t n) {
-    const char *hex_chars = "0123456789ABCDEF";
-    
-    // Print "0x" prefix
-    vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry('0', make_color(15, 4));
-    vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry('x', make_color(15, 4));
-
-    // Loop through 8 nibbles (4 bits each) because 32 bits / 4 = 8 chars
-    for (int i = 28; i >= 0; i -= 4) {
-        // Extract the nibble
-        uint8_t nibble = (n >> i) & 0xF; 
-        
-        // Print the character
-        vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry(hex_chars[nibble], make_color(15, 4));
-    }
-    
-    // Add a space after the number
-    cursor_x++; 
-}
-
-/* Helper to move to next line */
+/**
+ * @brief Advances the cursor to the next line.
+ */
 void print_newline() {
     cursor_x = 0;
     cursor_y++;
+    // TODO: Add scrolling when cursor_y >= VGA_HEIGHT
 }
 
-/* Helper to print a string */
+/**
+ * @brief Prints a null-terminated string to the screen at the current cursor position.
+ */
 void print_str(const char* str) {
-    for(int i=0; str[i] != 0; i++) {
-        vga_buffer[cursor_y * 80 + cursor_x++] = make_vgaentry(str[i], make_color(15, 4));
+    for(int i = 0; str[i] != '\0'; i++) {
+        if (str[i] == '\n') {
+            print_newline();
+        } else {
+            vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(str[i], make_color(15, 4));
+            cursor_x++;
+            if (cursor_x >= VGA_WIDTH) {
+                print_newline();
+            }
+        }
     }
 }
 
-/* Update signature to take a POINTER */
-void fault_handler(registers_t* regs) {
-    
-    // Tactic 1: Handle Divide by Zero (INT 0)
-    if (regs->int_no == 0) {
-        // 1. Notify (Optional - can be silent in production)
-        print_str("[FALCON] Div-by-Zero detected! Patching...");
-        print_newline();
-
-        // 2. THE FIX: Skip the bad instruction.
-        // Most 'div' instructions are 2 or 3 bytes long.
-        // This is a heuristic. In a real OS, we would decode the instruction.
-        // For 'div eax' (F7 F0) or similar, 2 bytes is a safe bet for this demo.
-        regs->eip += 2; 
-
-        // 3. THE SANITIZATION:
-        // Since the division failed, EAX (the result) contains garbage.
-        // Let's force it to 0 so the program logic usually continues safely.
-        regs->eax = 0;
-
-        // 4. Return immediately! Do not halt.
-        return; 
+/**
+ * @brief Clears the entire screen and resets the cursor to the top-left.
+ */
+void clear_screen() {
+    for (int y = 0; y < VGA_HEIGHT; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            vga_buffer[y * VGA_WIDTH + x] = make_vgaentry(' ', make_color(15, 4));
+        }
     }
-
-    // Tactic 2: Handle all other crashes
-    if (regs->int_no < 32) {
-        // ... (קוד המסך האדום הרגיל שלך כאן) ...
-        print_str("FATAL UNRECOVERABLE ERROR");
-        asm volatile("cli; hlt");
-    }
-}
-/* --- Low Level I/O Functions --- */
-
-/* Write a byte to a hardware port */
-void outb(uint16_t port, uint8_t val) {
-    asm volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
+    cursor_x = 0;
+    cursor_y = 0;
 }
 
-/* Setup a gate in the IDT */
+
+//==============================================================================
+// SECTION: INTERRUPT & PIC HANDLING
+//==============================================================================
+
+/**
+ * @brief Sets up a gate (entry) in the Interrupt Descriptor Table (IDT).
+ */
 void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].offset_low = base & 0xFFFF;
     idt[num].offset_high = (base >> 16) & 0xFFFF;
@@ -172,65 +228,45 @@ void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].type_attr = flags;
 }
 
-/* Initialize IDT */
+/**
+ * @brief Initializes the Interrupt Descriptor Table (IDT).
+ */
 void init_idt() {
     idt_ptr.limit = (sizeof(struct idt_entry_t) * 256) - 1;
     idt_ptr.base  = (uint32_t)&idt;
     asm volatile("lidt %0" : : "m" (idt_ptr));
 }
 
-/* --- The Heart of Falcon --- */
-
-volatile uint32_t tick = 0;
-
-/* The Timer Handler (Called by hardware ~18 times per second by default) */
-void timer_handler() {
-    tick++;
-
-    // Visual: A beating heart in the top-left corner
-    // On every 18th tick (approx 1 second), flash a heart
-    if (tick % 18 < 10) {
-        // Draw Heart (ASCII 3) in Red
-        vga_buffer[0] = make_vgaentry(3, make_color(4, 1)); 
-    } else {
-        // Draw empty space
-        vga_buffer[0] = make_vgaentry(' ', make_color(1, 1));
-    }
-
-    // CRITICAL: Send End-of-Interrupt (EOI) to the Master PIC
-    // If we don't do this, the PIC will never send another interrupt.
-    outb(PIC1_COMMAND, 0x20);
-}
-
-/* Remap the PIC to avoid conflicts with CPU exceptions */
-void init_timer() {
-    // 1. Start initialization sequence (ICW1)
+/**
+ * @brief Initializes the Programmable Interrupt Controller (PIC).
+ */
+void init_pic() {
+    // Start initialization sequence
     outb(PIC1_COMMAND, 0x11);
     outb(PIC2_COMMAND, 0x11);
 
-    // 2. Remap offsets (ICW2)
-    // Map Master PIC to interrupt 32 (0x20)
-    outb(PIC1_DATA, 0x20); 
-    // Map Slave PIC to interrupt 40 (0x28)
-    outb(PIC2_DATA, 0x28); 
+    // Remap offsets: Master PIC to 32 (0x20), Slave PIC to 40 (0x28)
+    outb(PIC1_DATA, 0x20);
+    outb(PIC2_DATA, 0x28);
 
-    // 3. Setup cascading (ICW3) - tell them how they are connected
+    // Setup cascading
     outb(PIC1_DATA, 0x04);
     outb(PIC2_DATA, 0x02);
 
-    // 4. Environment info (ICW4) - 8086 mode
+    // Set 8086 mode
     outb(PIC1_DATA, 0x01);
     outb(PIC2_DATA, 0x01);
 
-    // 5. Unmask interrupts (Allow Timer)
-    // 0xFE = 11111110 in binary. The zero means "Enable IRQ0 (Timer)"
-    outb(PIC1_DATA, 0xFE);
+    // Unmask interrupts: Enable IRQ0 (Timer) and IRQ1 (Keyboard)
+    outb(PIC1_DATA, 0xFC);
     outb(PIC2_DATA, 0xFF);
 }
 
-
-void init_interrupts()
-{
+/**
+ * @brief Populates the IDT with handlers for CPU exceptions and hardware IRQs.
+ */
+void init_interrupts() {
+    // CPU Exceptions
     idt_set_gate(0, (uint32_t)isr0, 0x08, 0x8E);
     idt_set_gate(1, (uint32_t)isr1, 0x08, 0x8E);
     idt_set_gate(2, (uint32_t)isr2, 0x08, 0x8E);
@@ -247,59 +283,136 @@ void init_interrupts()
     idt_set_gate(13, (uint32_t)isr13, 0x08, 0x8E);
     idt_set_gate(14, (uint32_t)isr14, 0x08, 0x8E);
     idt_set_gate(15, (uint32_t)isr15, 0x08, 0x8E);
+
+    // Hardware (PIC) Interrupts
+    idt_set_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);   // IRQ 0: Timer
+    idt_set_gate(33, (uint32_t)keyboard_wrapper, 0x08, 0x8E); // IRQ 1: Keyboard
+}
+
+/**
+ * @brief Generic C-level handler for CPU exceptions.
+ */
+void fault_handler(registers_t* regs) {
+    if (regs->int_no < 32) {
+        print_str("CPU Exception - System Halted.\n");
+        asm volatile("cli; hlt");
+    }
+}
+
+/**
+ * @brief C-level handler for the timer interrupt (IRQ 0).
+ */
+void timer_handler() {
+    static uint32_t tick = 0;
+    tick++;
+
+    // Visual "heartbeat" in the top-left corner
+    if ((tick % 18) < 9) {
+        vga_buffer[0] = make_vgaentry(3, make_color(12, 1)); // Red heart
+    } else {
+        vga_buffer[0] = make_vgaentry(' ', make_color(0, 1));
+    }
+
+    // CRITICAL: Send End-of-Interrupt (EOI) to the Master PIC.
+    outb(PIC1_COMMAND, 0x20);
 }
 
 
-/* --- Main --- */
-void kmain(void) {
-    // ... init code ...
-    init_idt();
-    init_interrupts();
-    asm volatile("sti");
+//==============================================================================
+// SECTION: KEYBOARD DRIVER
+//==============================================================================
 
-    /* --- SCENARIO: THE INDESTRUCTIBLE SYSTEM --- */
+// Scancode to ASCII map for a standard US keyboard layout.
+unsigned char kbdus[128] =
+{
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
+    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*',
+    0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    '-', 0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
 
-    // 1. Setup Critical Data (TMR)
-    ProtectedInt fuel_level;
-    write_safe(&fuel_level, 100); // 100% Fuel
+/**
+ * @brief C-level handler for the keyboard interrupt (IRQ 1).
+ */
+void keyboard_handler() {
+    uint8_t scancode = inb(KBD_DATA_PORT);
 
-    print_str("System check... Fuel at 100%");
-    print_newline();
+    // We only handle key presses (scancode bit 7 is 0).
+    if (!(scancode & 0x80)) {
+        char c = kbdus[scancode];
 
-    // 2. ATTACK 1: Memory Corruption
-    // A cosmic ray hits memory!
-    fuel_level.v2 = 99999; 
-    
-    // Validate TMR works
-    uint32_t current_fuel = read_safe(&fuel_level);
-    if (current_fuel == 100) {
-        print_str("Memory Corruption Detected & Repaired automatically.");
-        print_newline();
-    } else {
-        print_str("Memory Repair Failed!"); // Should not happen
+        if (c == '\n') {
+            print_newline();
+            cmd_buffer[cmd_buffer_idx] = '\0';
+            process_command(cmd_buffer);
+            cmd_buffer_idx = 0;
+        } else if (c == '\b') {
+            if (cmd_buffer_idx > 0) {
+                cmd_buffer_idx--;
+                if (cursor_x > 0) {
+                    cursor_x--;
+                    vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(' ', make_color(15, 4));
+                }
+            }
+        } else if (c && cmd_buffer_idx < CMD_BUFFER_SIZE - 1) {
+            cmd_buffer[cmd_buffer_idx++] = c;
+            vga_buffer[cursor_y * VGA_WIDTH + cursor_x++] = make_vgaentry(c, make_color(15, 4));
+        }
+
+        if (cursor_x >= VGA_WIDTH) {
+            print_newline();
+        }
     }
 
-    // 3. ATTACK 2: Logic Crash (Divide by Zero)
-    print_str("Attempting illegal calculation...");
-    print_newline();
-    
-    int a = 10;
-    int b = 0;
-    int result;
-    
-    // This generates a 'div' instruction that normally kills the PC
-    // But our new handler should catch it, print a message, and set result to 0.
-    asm volatile (
-        "div %2"
-        : "=a"(result) 
-        : "a"(a), "r"(b) // EAX=10, divisor=0
-    );
+    outb(PIC1_COMMAND, 0x20);
+}
 
-    // If we get here, we survived the crash!
-    print_str("I AM STILL ALIVE!");
-    print_newline();
-    print_str("Result fixed to: ");
-    print_hex(result); // Should be 0 (our manual fix)
 
-    while(1);
+//==============================================================================
+// SECTION: COMMAND SHELL
+//==============================================================================
+
+/**
+ * @brief Processes a command received from the keyboard handler.
+ */
+void process_command(char* command) {
+    if (strcmp(command, "help") == 0) {
+        print_str("Project Falcon OS - Command List:\n");
+        print_str("  help  - Display this message\n");
+        print_str("  clear - Clear the terminal screen\n");
+        print_str("  echo [text] - Print back the given text\n");
+    } else if (strncmp(command, "echo ", 5) == 0) {
+        print_str(command + 5);
+        print_newline();
+    } else if (strcmp(command, "clear") == 0) {
+        clear_screen();
+    } else if (command[0] != '\0') {
+        print_str("Unknown command: '");
+        print_str(command);
+        print_str("\n");
+    }
+    print_str("> ");
+}
+
+
+//==============================================================================
+// SECTION: KERNEL MAIN
+//==============================================================================
+
+/**
+ * @brief The entry point for the C part of the kernel.
+ */
+void kmain(void) {
+    init_idt();
+    init_pic();
+    init_interrupts();
+
+    asm volatile("sti");
+
+    print_str("Welcome to Project Falcon OS!\n");
+    print_str("> ");
+
+    for(;;);
 }
