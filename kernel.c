@@ -1,28 +1,11 @@
-/**
- * @file kernel.c
- * @brief Project Falcon's Simple Kernel
- *
- * This file contains the C part of the kernel, including the entry point `kmain`.
- * It handles interrupt setup, basic hardware drivers (VGA, keyboard), and a
- * simple command-line shell.
- *
- * Architecture:
- *  - kmain: Initializes all subsystems and enters an infinite loop.
- *  - Interrupts: CPU exceptions and hardware IRQs are handled.
- *    - The PIC is remapped to avoid conflicts with CPU exceptions.
- *    - The IDT is populated with ISRs (Interrupt Service Routines).
- *    - C handlers are implemented for CPU faults, the timer, and the keyboard.
- *  - Drivers:
- *    - VGA: Simple, direct-write text-mode output.
- *    - Keyboard: Reads scancodes, translates them, and buffers them for the shell.
- *  - Shell: A simple command interpreter for basic OS interaction.
+/*
+ * kernel.c - Project Falcon Kernel
+ * Handles interrupts, basic drivers (VGA, Keyboard), and shell.
  */
 
 #include <stdint.h>
 
-//==============================================================================
-// SECTION: CONSTANTS AND GLOBALS
-//==============================================================================
+// --- Constants and Globals ---
 
 // --- Hardware I/O Ports ---
 #define PIC1_COMMAND 0x20
@@ -46,8 +29,7 @@ int cursor_y = 0;
 char cmd_buffer[CMD_BUFFER_SIZE];
 int cmd_buffer_idx = 0;
 
-// --- CPU State (for fault handling) ---
-// This struct maps to the stack layout created by 'isr_common_stub' in boot.s.
+// --- CPU State ---
 typedef struct {
     uint32_t ds;                                     // Data segment selector
     uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax; // Pushed by pushad
@@ -73,12 +55,33 @@ struct idt_ptr_t {
 struct idt_entry_t idt[256];
 struct idt_ptr_t idt_ptr;
 
+// --- Multiboot Structures ---
+typedef struct multiboot_memory_map {
+    uint32_t size;
+    uint32_t addr_low;
+    uint32_t addr_high;
+    uint32_t len_low;
+    uint32_t len_high;
+    uint32_t type;
+} multiboot_memory_map_t;
 
-//==============================================================================
-// SECTION: ASSEMBLY FUNCTION PROTOTYPES
-//==============================================================================
-// These wrappers are defined in boot.s. They form the bridge between
-// a hardware/CPU interrupt and its C handler.
+typedef struct multiboot_info {
+    uint32_t flags;
+    uint32_t mem_lower;
+    uint32_t mem_upper;
+    uint32_t boot_device;
+    uint32_t cmdline;
+    uint32_t mods_count;
+    uint32_t mods_addr;
+    uint32_t syms[4];
+    uint32_t mmap_length;
+    uint32_t mmap_addr;
+} multiboot_info_t;
+
+// Global pointer to the Multiboot info structure (initialized in kmain)
+multiboot_info_t* global_mboot_info = 0;
+
+// --- Assembly Function Prototypes ---
 
 extern void timer_wrapper(void);
 extern void keyboard_wrapper(void);
@@ -90,21 +93,14 @@ extern void isr8(); extern void isr9(); extern void isr10(); extern void isr11()
 extern void isr12(); extern void isr13(); extern void isr14(); extern void isr15();
 
 
-//==============================================================================
-// SECTION: FORWARD DECLARATIONS OF C FUNCTIONS
-//==============================================================================
+// --- Forward Declarations ---
 void process_command(char* command);
 void print_newline();
 
 
-//==============================================================================
-// SECTION: UTILITY FUNCTIONS
-//==============================================================================
+// --- Utility Functions ---
 
-/**
- * @brief Compares two null-terminated strings.
- * @return 0 if strings are identical, non-zero otherwise.
- */
+// Compares two strings
 int strcmp(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) {
         s1++;
@@ -113,10 +109,7 @@ int strcmp(const char* s1, const char* s2) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
-/**
- * @brief Compares the first n bytes of two strings.
- * @return 0 if strings are identical up to n chars, non-zero otherwise.
- */
+// Compares first n bytes of two strings
 int strncmp(const char* s1, const char* s2, int n) {
     while (n && *s1 && (*s1 == *s2)) {
         --n;
@@ -130,61 +123,85 @@ int strncmp(const char* s1, const char* s2, int n) {
     }
 }
 
+// Copies n bytes from src to dest
+void* memcpy(void* dest, const void* src, int n) {
+    char* d = (char*)dest;
+    const char* s = (const char*)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
 
-//==============================================================================
-// SECTION: LOW-LEVEL I/O
-//==============================================================================
+// Fills first n bytes of s with c
+void* memset(void* s, int c, int n) {
+    unsigned char* p = (unsigned char*)s;
+    while (n--) {
+        *p++ = (unsigned char)c;
+    }
+    return s;
+}
 
-/**
- * @brief Writes a byte to the specified hardware port.
- */
+void print_dec(uint32_t n);
+void print_hex(uint32_t n);
+
+// --- Low-Level I/O ---
+
+// Write byte to port
 void outb(uint16_t port, uint8_t val) {
     asm volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
 }
 
-/**
- * @brief Reads a byte from the specified hardware port.
- * @return The byte value read from the port.
- */
+// Read byte from port
 uint8_t inb(uint16_t port) {
     uint8_t ret;
     asm volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) );
     return ret;
 }
 
+// Write word to port
+void outw(uint16_t port, uint16_t val) {
+    asm volatile ( "outw %0, %1" : : "a"(val), "Nd"(port) );
+}
 
-//==============================================================================
-// SECTION: VGA TEXT MODE DRIVER
-//==============================================================================
 
-/**
- * @brief Creates a VGA color attribute byte.
- */
+// --- VGA Text Mode Driver ---
+
+// Create color attribute
 uint8_t make_color(uint8_t fg, uint8_t bg) {
     return (bg << 4) | fg;
 }
 
-/**
- * @brief Creates a 16-bit VGA buffer entry.
- */
+// Create VGA entry
 uint16_t make_vgaentry(char c, uint8_t color) {
     uint16_t c16 = c;
     uint16_t color16 = color;
     return c16 | (color16 << 8);
 }
 
-/**
- * @brief Advances the cursor to the next line.
- */
+// Scroll screen up
+void terminal_scroll() {
+    for (int y = 0; y < VGA_HEIGHT - 1; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            vga_buffer[y * VGA_WIDTH + x] = vga_buffer[(y + 1) * VGA_WIDTH + x];
+        }
+    }
+    for (int x = 0; x < VGA_WIDTH; x++) {
+        vga_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = make_vgaentry(' ', make_color(15, 4));
+    }
+}
+
+// Advance cursor to next line
 void print_newline() {
     cursor_x = 0;
     cursor_y++;
-    // TODO: Add scrolling when cursor_y >= VGA_HEIGHT
+    if (cursor_y >= VGA_HEIGHT) {
+        terminal_scroll();
+        cursor_y = VGA_HEIGHT - 1;
+    }
 }
 
-/**
- * @brief Prints a null-terminated string to the screen at the current cursor position.
- */
+// Print string
 void print_str(const char* str) {
     for(int i = 0; str[i] != '\0'; i++) {
         if (str[i] == '\n') {
@@ -199,9 +216,7 @@ void print_str(const char* str) {
     }
 }
 
-/**
- * @brief Clears the entire screen and resets the cursor to the top-left.
- */
+// Clear screen
 void clear_screen() {
     for (int y = 0; y < VGA_HEIGHT; y++) {
         for (int x = 0; x < VGA_WIDTH; x++) {
@@ -212,14 +227,47 @@ void clear_screen() {
     cursor_y = 0;
 }
 
+// Print decimal number
+void print_dec(uint32_t n) {
+    if (n == 0) {
+        print_str("0");
+        return;
+    }
+    char buf[32];
+    int i = 0;
+    while (n > 0) {
+        buf[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+    // Reverse buffer
+    for (int j = 0; j < i / 2; j++) {
+        char temp = buf[j];
+        buf[j] = buf[i - j - 1];
+        buf[i - j - 1] = temp;
+    }
+    buf[i] = '\0';
+    print_str(buf);
+}
 
-//==============================================================================
-// SECTION: INTERRUPT & PIC HANDLING
-//==============================================================================
+// Print hex number
+void print_hex(uint32_t n) {
+    print_str("0x");
+    char hex_chars[] = "0123456789ABCDEF";
+    char buf[9];
+    buf[8] = '\0';
+    for (int i = 7; i >= 0; i--) {
+        buf[i] = hex_chars[n & 0xF];
+        n >>= 4;
+    }
+    // Skip leading zeros (optional, but looks nicer)
+    char* p = buf;
+    while (*p == '0' && *(p+1) != '\0') p++;
+    print_str(p);
+}
 
-/**
- * @brief Sets up a gate (entry) in the Interrupt Descriptor Table (IDT).
- */
+// --- Interrupt & PIC Handling ---
+
+// Set IDT gate
 void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].offset_low = base & 0xFFFF;
     idt[num].offset_high = (base >> 16) & 0xFFFF;
@@ -228,18 +276,14 @@ void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].type_attr = flags;
 }
 
-/**
- * @brief Initializes the Interrupt Descriptor Table (IDT).
- */
+// Initialize IDT
 void init_idt() {
     idt_ptr.limit = (sizeof(struct idt_entry_t) * 256) - 1;
     idt_ptr.base  = (uint32_t)&idt;
     asm volatile("lidt %0" : : "m" (idt_ptr));
 }
 
-/**
- * @brief Initializes the Programmable Interrupt Controller (PIC).
- */
+// Initialize PIC
 void init_pic() {
     // Start initialization sequence
     outb(PIC1_COMMAND, 0x11);
@@ -262,9 +306,7 @@ void init_pic() {
     outb(PIC2_DATA, 0xFF);
 }
 
-/**
- * @brief Populates the IDT with handlers for CPU exceptions and hardware IRQs.
- */
+// Populate IDT
 void init_interrupts() {
     // CPU Exceptions
     idt_set_gate(0, (uint32_t)isr0, 0x08, 0x8E);
@@ -289,9 +331,7 @@ void init_interrupts() {
     idt_set_gate(33, (uint32_t)keyboard_wrapper, 0x08, 0x8E); // IRQ 1: Keyboard
 }
 
-/**
- * @brief Generic C-level handler for CPU exceptions.
- */
+// Generic CPU exception handler
 void fault_handler(registers_t* regs) {
     if (regs->int_no < 32) {
         print_str("CPU Exception - System Halted.\n");
@@ -299,28 +339,23 @@ void fault_handler(registers_t* regs) {
     }
 }
 
-/**
- * @brief C-level handler for the timer interrupt (IRQ 0).
- */
+// Timer interrupt handler (IRQ 0)
 void timer_handler() {
     static uint32_t tick = 0;
     tick++;
 
     // Visual "heartbeat" in the top-left corner
     if ((tick % 18) < 9) {
-        vga_buffer[0] = make_vgaentry(3, make_color(12, 1)); // Red heart
+        vga_buffer[VGA_WIDTH - 1] = make_vgaentry(3, make_color(12, 1)); // Red heart
     } else {
-        vga_buffer[0] = make_vgaentry(' ', make_color(0, 1));
+        vga_buffer[VGA_WIDTH - 1] = make_vgaentry(' ', make_color(0, 1));
     }
 
     // CRITICAL: Send End-of-Interrupt (EOI) to the Master PIC.
     outb(PIC1_COMMAND, 0x20);
 }
 
-
-//==============================================================================
-// SECTION: KEYBOARD DRIVER
-//==============================================================================
+// --- Keyboard Driver ---
 
 // Scancode to ASCII map for a standard US keyboard layout.
 unsigned char kbdus[128] =
@@ -333,9 +368,7 @@ unsigned char kbdus[128] =
     '-', 0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
-/**
- * @brief C-level handler for the keyboard interrupt (IRQ 1).
- */
+// Keyboard interrupt handler (IRQ 1)
 void keyboard_handler() {
     uint8_t scancode = inb(KBD_DATA_PORT);
 
@@ -370,24 +403,58 @@ void keyboard_handler() {
 }
 
 
-//==============================================================================
-// SECTION: COMMAND SHELL
-//==============================================================================
+// --- Command Shell ---
 
-/**
- * @brief Processes a command received from the keyboard handler.
- */
+// Print memory map
+void print_mmap() {
+    if (global_mboot_info == 0 || !(global_mboot_info->flags & (1 << 6))) {
+        print_str("Memory map not available.\n");
+        return;
+    }
+
+    print_str("Physical Memory Map:\n");
+    multiboot_memory_map_t* mmap = (multiboot_memory_map_t*)global_mboot_info->mmap_addr;
+    uint32_t mmap_end = global_mboot_info->mmap_addr + global_mboot_info->mmap_length;
+
+    while ((uint32_t)mmap < mmap_end) {
+        print_str("Addr: "); print_hex(mmap->addr_low);
+        print_str(" Len: "); print_hex(mmap->len_low);
+        print_str(" Type: "); print_dec(mmap->type);
+        
+        if (mmap->type == 1) print_str(" (RAM)");
+        else print_str(" (Reserved)");
+        
+        print_str("\n");
+        mmap = (multiboot_memory_map_t*)((uint32_t)mmap + mmap->size + sizeof(uint32_t));
+    }
+}
+
+// Shutdown system
+void shutdown() {
+    print_str("Shutting down...\n");
+    outw(0x604, 0x2000);  // QEMU shutdown command
+    outw(0xB004, 0x2000); // Bochs shutdown command
+    asm volatile("cli; hlt"); // Fallback: Halt CPU if shutdown fails
+}
+
+// Process command
 void process_command(char* command) {
     if (strcmp(command, "help") == 0) {
         print_str("Project Falcon OS - Command List:\n");
         print_str("  help  - Display this message\n");
         print_str("  clear - Clear the terminal screen\n");
         print_str("  echo [text] - Print back the given text\n");
+        print_str("  exit  - Shutdown the system\n");
+        print_str("  mmap  - Show memory map\n");
     } else if (strncmp(command, "echo ", 5) == 0) {
         print_str(command + 5);
         print_newline();
     } else if (strcmp(command, "clear") == 0) {
         clear_screen();
+    } else if (strcmp(command, "mmap") == 0) {
+        print_mmap();
+    } else if (strcmp(command, "exit") == 0) {
+        shutdown();
     } else if (command[0] != '\0') {
         print_str("Unknown command: '");
         print_str(command);
@@ -397,21 +464,32 @@ void process_command(char* command) {
 }
 
 
-//==============================================================================
-// SECTION: KERNEL MAIN
-//==============================================================================
+// --- Kernel Main ---
 
-/**
- * @brief The entry point for the C part of the kernel.
- */
-void kmain(void) {
+// Kernel entry point
+void kmain(uint32_t magic, multiboot_info_t* mboot_ptr) {
     init_idt();
     init_pic();
     init_interrupts();
 
+    global_mboot_info = mboot_ptr;
     asm volatile("sti");
+    clear_screen();
 
     print_str("Welcome to Project Falcon OS!\n");
+    
+    // Check Multiboot Magic Number
+    if (magic != 0x2BADB002) {
+        print_str("WARNING: Invalid Multiboot Magic Number!\n");
+    } else {
+        print_str("Multiboot Info Detected.\n");
+        if (mboot_ptr->flags & 1) {
+            print_str("Memory: ");
+            print_dec(mboot_ptr->mem_lower + mboot_ptr->mem_upper);
+            print_str(" KB\n");
+        }
+    }
+
     print_str("> ");
 
     for(;;);
