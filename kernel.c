@@ -9,6 +9,7 @@
 #include "vga.h"
 #include "idt.h"
 #include "keyboard.h"
+#include "pmm.h"
 
 // --- Multiboot Structures ---
 typedef struct multiboot_memory_map {
@@ -89,7 +90,10 @@ void process_command(char* command) {
         print_mmap();
     } else if (strcmp(command, "exit") == 0) {
         shutdown();
-    } else if (command[0] != '\0') {
+    }else if(strcmp(command, "moshi") == 0) {
+        print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
+    }
+    else if (command[0] != '\0') {
         print_str("Unknown command: '");
         print_str(command);
         print_str("\n");
