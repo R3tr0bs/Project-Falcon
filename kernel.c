@@ -90,6 +90,15 @@ void process_command(char* command) {
         print_mmap();
     } else if (strcmp(command, "exit") == 0) {
         shutdown();
+    } else if (strcmp(command, "alloc") == 0) {
+        void* ptr = pmm_alloc_block();
+        if (ptr) {
+            print_str("Allocated page at: ");
+            print_hex((uint32_t)ptr);
+            print_str("\n");
+        } else {
+            print_str("Out of memory!\n");
+        }
     }else if(strcmp(command, "moshi") == 0) {
         print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
     }
@@ -125,6 +134,27 @@ void kmain(uint32_t magic, multiboot_info_t* mboot_ptr) {
             print_str("Memory: ");
             print_dec(mboot_ptr->mem_lower + mboot_ptr->mem_upper);
             print_str(" KB\n");
+
+            // Initialize PMM
+            uint32_t mem_size = (mboot_ptr->mem_lower + mboot_ptr->mem_upper) * 1024;
+            pmm_init(mem_size);
+
+            // Parse memory map to mark free regions
+            multiboot_memory_map_t* mmap = (multiboot_memory_map_t*)mboot_ptr->mmap_addr;
+            uint32_t mmap_end = mboot_ptr->mmap_addr + mboot_ptr->mmap_length;
+
+            while ((uint32_t)mmap < mmap_end) {
+                if (mmap->type == 1) { // 1 = Available RAM
+                    pmm_mark_region_free(mmap->addr_low, mmap->len_low);
+                }
+                mmap = (multiboot_memory_map_t*)((uint32_t)mmap + mmap->size + sizeof(uint32_t));
+            }
+
+            // Reserve the first 2MB (Includes Kernel code, VGA buffer, BIOS data)
+            // This prevents the PMM from allocating memory over our own kernel code.
+            pmm_mark_region_used(0, 0x200000);
+
+            print_str("PMM Initialized.\n");
         }
     }
 
