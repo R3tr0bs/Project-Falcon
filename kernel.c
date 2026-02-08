@@ -81,6 +81,7 @@ void process_command(char* command) {
         print_str("  echo [text] - Print back the given text\n");
         print_str("  exit  - Shutdown the system\n");
         print_str("  mmap  - Show memory map\n");
+        print_str("  alloc  - Allocates memory and state address\n");
     } else if (strncmp(command, "echo ", 5) == 0) {
         print_str(command + 5);
         print_newline();
