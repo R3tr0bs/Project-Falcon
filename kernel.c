@@ -39,16 +39,37 @@ multiboot_info_t* global_mboot_info = 0;
 
 #define MAX_FILES 16
 #define MAX_FILENAME 24
+#define MAX_DIRS 16
+#define MAX_DIRNAME 24
 
 typedef struct {
     int used;
     char name[MAX_FILENAME];
+    int dir_id;
     uint32_t size;
     uint32_t capacity;
     void* data;
 } ram_file_t;
 
 static ram_file_t ram_files[MAX_FILES];
+
+typedef struct {
+    int used;
+    char name[MAX_DIRNAME];
+    int parent;
+} dir_t;
+
+static dir_t dirs[MAX_DIRS];
+
+typedef enum {
+    SHELL_ROOT = 0,
+    SHELL_FILES = 1,
+    SHELL_DIRS = 2
+} shell_mode_t;
+
+static shell_mode_t shell_mode = SHELL_ROOT;
+static int current_dir = 0;
+static int open_file = -1;
 
 static void busy_wait(uint32_t ticks) {
     volatile uint32_t i = 0;
@@ -142,9 +163,180 @@ static void copy_name(char* dst, const char* src, int max) {
     dst[i] = '\0';
 }
 
-static int find_file_index(const char* name) {
+static void print_prompt() {
+    if (shell_mode == SHELL_FILES) {
+        print_str("files> ");
+    } else if (shell_mode == SHELL_DIRS) {
+        print_str("dirs> ");
+    } else {
+        print_str("> ");
+    }
+}
+
+static void init_dirs() {
+    for (int i = 0; i < MAX_DIRS; i++) {
+        dirs[i].used = 0;
+        dirs[i].name[0] = '\0';
+        dirs[i].parent = 0;
+    }
+    dirs[0].used = 1;
+    copy_name(dirs[0].name, "/", MAX_DIRNAME);
+    dirs[0].parent = 0;
+    current_dir = 0;
+    open_file = -1;
+    shell_mode = SHELL_ROOT;
+}
+
+static int find_dir_index(const char* name, int parent) {
+    for (int i = 0; i < MAX_DIRS; i++) {
+        if (dirs[i].used && dirs[i].parent == parent && strcmp(dirs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_free_dir_slot() {
+    for (int i = 0; i < MAX_DIRS; i++) {
+        if (!dirs[i].used) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void list_dirs() {
+    int any = 0;
+    for (int i = 0; i < MAX_DIRS; i++) {
+        if (dirs[i].used && dirs[i].parent == current_dir) {
+            print_str(dirs[i].name);
+            print_str("\n");
+            any = 1;
+        }
+    }
+    if (!any) {
+        print_str("No folders.\n");
+    }
+}
+
+static void dir_pwd() {
+    if (current_dir == 0) {
+        print_str("/\n");
+        return;
+    }
+    int stack[MAX_DIRS];
+    int depth = 0;
+    int idx = current_dir;
+    while (1) {
+        stack[depth++] = idx;
+        if (idx == 0 || depth >= MAX_DIRS) {
+            break;
+        }
+        idx = dirs[idx].parent;
+    }
+    print_str("/");
+    for (int i = depth - 2; i >= 0; i--) {
+        print_str(dirs[stack[i]].name);
+        if (i > 0) {
+            print_str("/");
+        }
+    }
+    print_str("\n");
+}
+
+static int dir_has_children(int dir_id) {
+    for (int i = 0; i < MAX_DIRS; i++) {
+        if (dirs[i].used && dirs[i].parent == dir_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int dir_has_files(int dir_id) {
     for (int i = 0; i < MAX_FILES; i++) {
-        if (ram_files[i].used && strcmp(ram_files[i].name, name) == 0) {
+        if (ram_files[i].used && ram_files[i].dir_id == dir_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void dir_mkdir(const char* name) {
+    if (!name || !*name) {
+        print_str("Missing folder name.\n");
+        return;
+    }
+    if (find_dir_index(name, current_dir) >= 0) {
+        print_str("Folder already exists.\n");
+        return;
+    }
+    int slot = find_free_dir_slot();
+    if (slot < 0) {
+        print_str("Folder table full.\n");
+        return;
+    }
+    dirs[slot].used = 1;
+    copy_name(dirs[slot].name, name, MAX_DIRNAME);
+    dirs[slot].parent = current_dir;
+    print_str("Folder created.\n");
+}
+
+static void dir_rmdir(const char* name) {
+    if (!name || !*name) {
+        print_str("Missing folder name.\n");
+        return;
+    }
+    int idx = find_dir_index(name, current_dir);
+    if (idx < 0 || idx == 0) {
+        print_str("Folder not found.\n");
+        return;
+    }
+    if (dir_has_children(idx) || dir_has_files(idx)) {
+        print_str("Folder not empty.\n");
+        return;
+    }
+    dirs[idx].used = 0;
+    dirs[idx].name[0] = '\0';
+    dirs[idx].parent = 0;
+    print_str("Folder removed.\n");
+}
+
+static void dir_cd(const char* name) {
+    if (!name || !*name || strcmp(name, "/") == 0) {
+        current_dir = 0;
+        if (open_file >= 0) {
+            if (ram_files[open_file].dir_id != current_dir) {
+                open_file = -1;
+            }
+        }
+        return;
+    }
+    if (strcmp(name, "..") == 0) {
+        current_dir = dirs[current_dir].parent;
+        if (open_file >= 0) {
+            if (ram_files[open_file].dir_id != current_dir) {
+                open_file = -1;
+            }
+        }
+        return;
+    }
+    int idx = find_dir_index(name, current_dir);
+    if (idx < 0) {
+        print_str("Folder not found.\n");
+        return;
+    }
+    current_dir = idx;
+    if (open_file >= 0) {
+        if (ram_files[open_file].dir_id != current_dir) {
+            open_file = -1;
+        }
+    }
+}
+
+static int find_file_index(const char* name, int dir_id) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (ram_files[i].used && ram_files[i].dir_id == dir_id && strcmp(ram_files[i].name, name) == 0) {
             return i;
         }
     }
@@ -163,8 +355,11 @@ static int find_free_file_slot() {
 static void list_files() {
     int any = 0;
     for (int i = 0; i < MAX_FILES; i++) {
-        if (ram_files[i].used) {
+        if (ram_files[i].used && ram_files[i].dir_id == current_dir) {
             print_str(ram_files[i].name);
+            if (i == open_file) {
+                print_str(" (open)");
+            }
             print_str(" ");
             print_dec(ram_files[i].size);
             print_str(" bytes\n");
@@ -177,7 +372,7 @@ static void list_files() {
 }
 
 static void file_stat(const char* name) {
-    int idx = find_file_index(name);
+    int idx = find_file_index(name, current_dir);
     if (idx < 0) {
         print_str("File not found.\n");
         return;
@@ -197,7 +392,7 @@ static void file_touch(const char* name) {
         print_str("Missing filename.\n");
         return;
     }
-    if (find_file_index(name) >= 0) {
+    if (find_file_index(name, current_dir) >= 0) {
         print_str("File already exists.\n");
         return;
     }
@@ -208,6 +403,7 @@ static void file_touch(const char* name) {
     }
     ram_files[slot].used = 1;
     copy_name(ram_files[slot].name, name, MAX_FILENAME);
+    ram_files[slot].dir_id = current_dir;
     ram_files[slot].size = 0;
     ram_files[slot].capacity = 0;
     ram_files[slot].data = 0;
@@ -215,7 +411,7 @@ static void file_touch(const char* name) {
 }
 
 static void file_rm(const char* name) {
-    int idx = find_file_index(name);
+    int idx = find_file_index(name, current_dir);
     if (idx < 0) {
         print_str("File not found.\n");
         return;
@@ -226,14 +422,18 @@ static void file_rm(const char* name) {
     }
     f->used = 0;
     f->name[0] = '\0';
+    f->dir_id = 0;
     f->size = 0;
     f->capacity = 0;
     f->data = 0;
+    if (open_file == idx) {
+        open_file = -1;
+    }
     print_str("File removed.\n");
 }
 
 static void file_cat(const char* name) {
-    int idx = find_file_index(name);
+    int idx = find_file_index(name, current_dir);
     if (idx < 0) {
         print_str("File not found.\n");
         return;
@@ -252,7 +452,7 @@ static void file_write(const char* name, const char* content) {
         print_str("Missing filename.\n");
         return;
     }
-    int idx = find_file_index(name);
+    int idx = find_file_index(name, current_dir);
     if (idx < 0) {
         int slot = find_free_file_slot();
         if (slot < 0) {
@@ -262,6 +462,7 @@ static void file_write(const char* name, const char* content) {
         idx = slot;
         ram_files[idx].used = 1;
         copy_name(ram_files[idx].name, name, MAX_FILENAME);
+        ram_files[idx].dir_id = current_dir;
         ram_files[idx].size = 0;
         ram_files[idx].capacity = 0;
         ram_files[idx].data = 0;
@@ -289,6 +490,54 @@ static void file_write(const char* name, const char* content) {
         ((char*)f->data)[size] = '\0';
     }
     print_str("File written.\n");
+}
+
+static void file_open(const char* name) {
+    int idx = find_file_index(name, current_dir);
+    if (idx < 0) {
+        print_str("File not found.\n");
+        return;
+    }
+    open_file = idx;
+    print_str("File opened.\n");
+}
+
+static void file_close() {
+    if (open_file < 0) {
+        print_str("No open file.\n");
+        return;
+    }
+    open_file = -1;
+    print_str("File closed.\n");
+}
+
+static void file_read_open() {
+    if (open_file < 0) {
+        print_str("No open file.\n");
+        return;
+    }
+    if (ram_files[open_file].dir_id != current_dir) {
+        print_str("Open file is in another folder.\n");
+        return;
+    }
+    if (!ram_files[open_file].data || ram_files[open_file].size == 0) {
+        print_str("\n");
+        return;
+    }
+    print_str((const char*)ram_files[open_file].data);
+    print_str("\n");
+}
+
+static void file_write_open(const char* content) {
+    if (open_file < 0) {
+        print_str("No open file.\n");
+        return;
+    }
+    if (ram_files[open_file].dir_id != current_dir) {
+        print_str("Open file is in another folder.\n");
+        return;
+    }
+    file_write(ram_files[open_file].name, content);
 }
 
 static void print_mmap_type(uint32_t type) {
@@ -372,132 +621,214 @@ void process_command(char* command) {
     char* cursor = command;
     char* cmd = next_token(&cursor);
     if (!cmd || cmd[0] == '\0') {
-        print_str("> ");
+        print_prompt();
         return;
     }
-    if (strcmp(cmd, "help") == 0) {
-        print_str("Project Falcon OS - Command List:\n");
-        print_str("  help  - Display this message\n");
-        print_str("  clear - Clear the terminal screen\n");
-        print_str("  echo [text] - Print back the given text\n");
-        print_str("  exit  - Shutdown the system\n");
-        print_str("  mmap  - Show memory map\n");
-        print_str("  mem  - Show memory usage\n");
-        print_str("  alloc [blocks] - Allocate memory blocks\n");
-        print_str("  free <addr> [blocks] - Free memory blocks\n");
-        print_str("  files/ls - List files\n");
-        print_str("  touch <name> - Create empty file\n");
-        print_str("  write <name> <text> - Write text to file\n");
-        print_str("  cat <name> - Print file contents\n");
-        print_str("  rm <name> - Delete file\n");
-        print_str("  stat <name> - Show file details\n");
-    } else if (strcmp(cmd, "echo") == 0) {
-        char* msg = skip_spaces(cursor);
-        if (msg && *msg) {
-            print_str(msg);
-        }
-        print_newline();
-    } else if (strcmp(cmd, "clear") == 0) {
-        clear_screen();
-    } else if (strcmp(cmd, "mmap") == 0) {
-        print_mmap();
-    } else if (strcmp(cmd, "mem") == 0) {
-        uint32_t total = pmm_get_total_blocks();
-        uint32_t used = pmm_get_used_blocks();
-        uint32_t free = pmm_get_free_blocks();
-        print_str("Total blocks: ");
-        print_dec(total);
-        print_str(" Used: ");
-        print_dec(used);
-        print_str(" Free: ");
-        print_dec(free);
-        print_str("\n");
-    } else if (strcmp(cmd, "exit") == 0) {
-        shutdown();
-    } else if (strcmp(cmd, "alloc") == 0) {
-        char* arg = next_token(&cursor);
-        uint32_t blocks = 1;
-        if (arg && *arg) {
-            if (!parse_u32(arg, &blocks) || blocks == 0) {
-                print_str("Invalid block count.\n");
-                print_str("> ");
-                return;
+    if (shell_mode == SHELL_ROOT) {
+        if (strcmp(cmd, "help") == 0) {
+            print_str("Root commands:\n");
+            print_str("  help  - Display this message\n");
+            print_str("  clear - Clear the terminal screen\n");
+            print_str("  echo [text] - Print back the given text\n");
+            print_str("  exit  - Shutdown the system\n");
+            print_str("  mmap  - Show memory map\n");
+            print_str("  mem  - Show memory usage\n");
+            print_str("  alloc [blocks] - Allocate memory blocks\n");
+            print_str("  free <addr> [blocks] - Free memory blocks\n");
+            print_str("  files - Enter files view\n");
+            print_str("  dirs  - Enter folders view\n");
+        } else if (strcmp(cmd, "echo") == 0) {
+            char* msg = skip_spaces(cursor);
+            if (msg && *msg) {
+                print_str(msg);
             }
-        }
-        void* ptr = pmm_alloc_blocks(blocks);
-        if (ptr) {
-            print_str("Allocated at: ");
-            print_hex((uint32_t)ptr);
-            print_str(" Blocks: ");
-            print_dec(blocks);
+            print_newline();
+        } else if (strcmp(cmd, "clear") == 0) {
+            clear_screen();
+        } else if (strcmp(cmd, "mmap") == 0) {
+            print_mmap();
+        } else if (strcmp(cmd, "mem") == 0) {
+            uint32_t total = pmm_get_total_blocks();
+            uint32_t used = pmm_get_used_blocks();
+            uint32_t free = pmm_get_free_blocks();
+            print_str("Total blocks: ");
+            print_dec(total);
+            print_str(" Used: ");
+            print_dec(used);
+            print_str(" Free: ");
+            print_dec(free);
             print_str("\n");
-        } else {
-            print_str("Out of memory!\n");
-        }
-    } else if (strcmp(cmd, "free") == 0) {
-        char* addr_str = next_token(&cursor);
-        char* count_str = next_token(&cursor);
-        uint32_t addr = 0;
-        uint32_t blocks = 1;
-        if (!addr_str || !parse_u32(addr_str, &addr)) {
-            print_str("Invalid address.\n");
-        } else {
-            if (count_str && *count_str) {
-                if (!parse_u32(count_str, &blocks) || blocks == 0) {
+        } else if (strcmp(cmd, "exit") == 0) {
+            shutdown();
+        } else if (strcmp(cmd, "alloc") == 0) {
+            char* arg = next_token(&cursor);
+            uint32_t blocks = 1;
+            if (arg && *arg) {
+                if (!parse_u32(arg, &blocks) || blocks == 0) {
                     print_str("Invalid block count.\n");
-                    print_str("> ");
+                    print_prompt();
                     return;
                 }
             }
-            pmm_free_blocks((void*)addr, blocks);
-            print_str("Freed.\n");
+            void* ptr = pmm_alloc_blocks(blocks);
+            if (ptr) {
+                print_str("Allocated at: ");
+                print_hex((uint32_t)ptr);
+                print_str(" Blocks: ");
+                print_dec(blocks);
+                print_str("\n");
+            } else {
+                print_str("Out of memory!\n");
+            }
+        } else if (strcmp(cmd, "free") == 0) {
+            char* addr_str = next_token(&cursor);
+            char* count_str = next_token(&cursor);
+            uint32_t addr = 0;
+            uint32_t blocks = 1;
+            if (!addr_str || !parse_u32(addr_str, &addr)) {
+                print_str("Invalid address.\n");
+            } else {
+                if (count_str && *count_str) {
+                    if (!parse_u32(count_str, &blocks) || blocks == 0) {
+                        print_str("Invalid block count.\n");
+                        print_prompt();
+                        return;
+                    }
+                }
+                pmm_free_blocks((void*)addr, blocks);
+                print_str("Freed.\n");
+            }
+        } else if (strcmp(cmd, "files") == 0) {
+            shell_mode = SHELL_FILES;
+        } else if (strcmp(cmd, "dirs") == 0) {
+            shell_mode = SHELL_DIRS;
+        } else if (strcmp(cmd, "moshi") == 0) {
+            print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
+        } else if (cmd[0] != '\0') {
+            print_str("Unknown command: '");
+            print_str(cmd);
+            print_str("\n");
         }
-    } else if (strcmp(cmd, "files") == 0 || strcmp(cmd, "ls") == 0) {
-        list_files();
-    } else if (strcmp(cmd, "touch") == 0) {
-        char* name = next_token(&cursor);
-        if (!name) {
-            print_str("Missing filename.\n");
-        } else {
-            file_touch(name);
+    } else if (shell_mode == SHELL_FILES) {
+        if (strcmp(cmd, "help") == 0) {
+            print_str("Files commands:\n");
+            print_str("  help  - Display this message\n");
+            print_str("  back  - Return to root\n");
+            print_str("  ls    - List files\n");
+            print_str("  touch <name> - Create empty file\n");
+            print_str("  write <name> <text> - Write text to file\n");
+            print_str("  write <text> - Write to open file\n");
+            print_str("  cat <name> - Print file contents\n");
+            print_str("  rm <name> - Delete file\n");
+            print_str("  stat <name> - Show file details\n");
+            print_str("  open <name> - Open file\n");
+            print_str("  read - Read open file\n");
+            print_str("  close - Close file\n");
+            print_str("  mkdir <name> - Create folder\n");
+            print_str("  rmdir <name> - Remove folder\n");
+            print_str("  cd <name|..|/> - Change folder\n");
+            print_str("  pwd - Show current folder\n");
+        } else if (strcmp(cmd, "back") == 0) {
+            shell_mode = SHELL_ROOT;
+        } else if (strcmp(cmd, "ls") == 0) {
+            list_files();
+        } else if (strcmp(cmd, "touch") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Missing filename.\n");
+            } else {
+                file_touch(name);
+            }
+        } else if (strcmp(cmd, "write") == 0) {
+            char* name = next_token(&cursor);
+            char* content = skip_spaces(cursor);
+            if (!name) {
+                file_write_open(content);
+            } else if (!content || !*content) {
+                print_str("Missing content.\n");
+            } else {
+                file_write(name, content);
+            }
+        } else if (strcmp(cmd, "cat") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Missing filename.\n");
+            } else {
+                file_cat(name);
+            }
+        } else if (strcmp(cmd, "rm") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Missing filename.\n");
+            } else {
+                file_rm(name);
+            }
+        } else if (strcmp(cmd, "stat") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Missing filename.\n");
+            } else {
+                file_stat(name);
+            }
+        } else if (strcmp(cmd, "open") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Missing filename.\n");
+            } else {
+                file_open(name);
+            }
+        } else if (strcmp(cmd, "read") == 0) {
+            file_read_open();
+        } else if (strcmp(cmd, "close") == 0) {
+            file_close();
+        } else if (strcmp(cmd, "mkdir") == 0) {
+            char* name = next_token(&cursor);
+            dir_mkdir(name);
+        } else if (strcmp(cmd, "rmdir") == 0) {
+            char* name = next_token(&cursor);
+            dir_rmdir(name);
+        } else if (strcmp(cmd, "cd") == 0) {
+            char* name = next_token(&cursor);
+            dir_cd(name);
+        } else if (strcmp(cmd, "pwd") == 0) {
+            dir_pwd();
+        } else if (cmd[0] != '\0') {
+            print_str("Unknown command: '");
+            print_str(cmd);
+            print_str("\n");
         }
-    } else if (strcmp(cmd, "write") == 0) {
-        char* name = next_token(&cursor);
-        char* content = skip_spaces(cursor);
-        if (!name) {
-            print_str("Missing filename.\n");
-        } else {
-            file_write(name, content);
+    } else {
+        if (strcmp(cmd, "help") == 0) {
+            print_str("Folders commands:\n");
+            print_str("  help  - Display this message\n");
+            print_str("  back  - Return to root\n");
+            print_str("  ls    - List folders\n");
+            print_str("  mkdir <name> - Create folder\n");
+            print_str("  rmdir <name> - Remove folder\n");
+            print_str("  cd <name|..|/> - Change folder\n");
+            print_str("  pwd - Show current folder\n");
+        } else if (strcmp(cmd, "back") == 0) {
+            shell_mode = SHELL_ROOT;
+        } else if (strcmp(cmd, "ls") == 0) {
+            list_dirs();
+        } else if (strcmp(cmd, "mkdir") == 0) {
+            char* name = next_token(&cursor);
+            dir_mkdir(name);
+        } else if (strcmp(cmd, "rmdir") == 0) {
+            char* name = next_token(&cursor);
+            dir_rmdir(name);
+        } else if (strcmp(cmd, "cd") == 0) {
+            char* name = next_token(&cursor);
+            dir_cd(name);
+        } else if (strcmp(cmd, "pwd") == 0) {
+            dir_pwd();
+        } else if (cmd[0] != '\0') {
+            print_str("Unknown command: '");
+            print_str(cmd);
+            print_str("\n");
         }
-    } else if (strcmp(cmd, "cat") == 0) {
-        char* name = next_token(&cursor);
-        if (!name) {
-            print_str("Missing filename.\n");
-        } else {
-            file_cat(name);
-        }
-    } else if (strcmp(cmd, "rm") == 0) {
-        char* name = next_token(&cursor);
-        if (!name) {
-            print_str("Missing filename.\n");
-        } else {
-            file_rm(name);
-        }
-    } else if (strcmp(cmd, "stat") == 0) {
-        char* name = next_token(&cursor);
-        if (!name) {
-            print_str("Missing filename.\n");
-        } else {
-            file_stat(name);
-        }
-    } else if(strcmp(cmd, "moshi") == 0) {
-        print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
-    } else if (cmd[0] != '\0') {
-        print_str("Unknown command: '");
-        print_str(cmd);
-        print_str("\n");
     }
-    print_str("> ");
+    print_prompt();
 }
 
 
@@ -552,7 +883,8 @@ void kmain(uint32_t magic, multiboot_info_t* mboot_ptr) {
         }
     }
 
-    print_str("> ");
+    init_dirs();
+    print_prompt();
 
     for(;;);
 }
