@@ -50,6 +50,32 @@ typedef struct {
 
 static ram_file_t ram_files[MAX_FILES];
 
+static void busy_wait(uint32_t ticks) {
+    volatile uint32_t i = 0;
+    while (i < ticks) {
+        i++;
+    }
+}
+
+static void show_loading_screen() {
+    print_str("Project Falcon OS\n");
+    print_str("Loading");
+    for (int i = 0; i < 3; i++) {
+        busy_wait(8000000);
+        print_str(".");
+    }
+    print_str("\n");
+}
+
+static void show_logo() {
+    print_str("  _____      _           _   _           \n");
+    print_str(" |  ___|__ _| | ___  ___| |_(_)_ __      \n");
+    print_str(" | |_ / _` | |/ _ \\/ __| __| | '_ \\     \n");
+    print_str(" |  _| (_| | |  __/\\__ \\ |_| | | | |    \n");
+    print_str(" |_|  \\__,_|_|\\___||___/\\__|_|_| |_|    \n");
+    print_str("\n");
+}
+
 static char* skip_spaces(char* s) {
     while (s && (*s == ' ' || *s == '\t')) {
         s++;
@@ -486,6 +512,10 @@ void kmain(uint32_t magic, multiboot_info_t* mboot_ptr) {
     global_mboot_info = mboot_ptr;
     asm volatile("sti");
     clear_screen();
+
+    show_loading_screen();
+    clear_screen();
+    show_logo();
 
     print_str("Welcome to Project Falcon OS!\n");
     
