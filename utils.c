@@ -21,6 +21,14 @@ int strncmp(const char* s1, const char* s2, int n) {
     }
 }
 
+int strlen(const char* s) {
+    int len = 0;
+    while (s[len]) {
+        len++;
+    }
+    return len;
+}
+
 void* memcpy(void* dest, const void* src, int n) {
     char* d = (char*)dest;
     const char* s = (const char*)src;
