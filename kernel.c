@@ -41,6 +41,7 @@ multiboot_info_t* global_mboot_info = 0;
 #define MAX_FILENAME 24
 #define MAX_DIRS 16
 #define MAX_DIRNAME 24
+#define NET_MAX_BYTES 256
 
 typedef struct {
     int used;
@@ -64,12 +65,15 @@ static dir_t dirs[MAX_DIRS];
 typedef enum {
     SHELL_ROOT = 0,
     SHELL_FILES = 1,
-    SHELL_DIRS = 2
+    SHELL_DIRS = 2,
+    SHELL_NET = 3
 } shell_mode_t;
 
 static shell_mode_t shell_mode = SHELL_ROOT;
 static int current_dir = 0;
 static int open_file = -1;
+static uint8_t net_last_payload[NET_MAX_BYTES];
+static uint32_t net_last_len = 0;
 
 static void busy_wait(uint32_t ticks) {
     volatile uint32_t i = 0;
@@ -154,6 +158,99 @@ static int parse_u32(const char* s, uint32_t* out) {
     return 1;
 }
 
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+static int parse_hex_stream(const char* s, uint8_t* out, uint32_t max_bytes, uint32_t* out_len) {
+    uint32_t count = 0;
+    int have_high = 0;
+    uint8_t high = 0;
+    while (s && *s) {
+        char c = *s++;
+        int v = hex_val(c);
+        if (v < 0) {
+            if (c == ' ' || c == '\t' || c == ',' || c == ':' || c == '-') {
+                continue;
+            }
+            return 0;
+        }
+        if (!have_high) {
+            high = (uint8_t)v;
+            have_high = 1;
+        } else {
+            if (count >= max_bytes) {
+                return 0;
+            }
+            out[count++] = (uint8_t)((high << 4) | (uint8_t)v);
+            have_high = 0;
+        }
+    }
+    if (have_high) {
+        return 0;
+    }
+    *out_len = count;
+    return 1;
+}
+
+static void print_byte_hex(uint8_t v) {
+    char hex_chars[] = "0123456789ABCDEF";
+    char buf[3];
+    buf[0] = hex_chars[(v >> 4) & 0xF];
+    buf[1] = hex_chars[v & 0xF];
+    buf[2] = '\0';
+    print_str(buf);
+}
+
+static void net_clear() {
+    net_last_len = 0;
+}
+
+static void net_send_hex(const char* data) {
+    uint32_t len = 0;
+    if (!data || !*data) {
+        print_str("Missing hex payload.\n");
+        return;
+    }
+    if (!parse_hex_stream(data, net_last_payload, NET_MAX_BYTES, &len)) {
+        print_str("Invalid hex payload.\n");
+        return;
+    }
+    net_last_len = len;
+    print_str("Sent bytes: ");
+    print_dec(net_last_len);
+    print_str("\n");
+}
+
+static void net_print_last() {
+    if (net_last_len == 0) {
+        print_str("No payload.\n");
+        return;
+    }
+    for (uint32_t i = 0; i < net_last_len; i++) {
+        print_byte_hex(net_last_payload[i]);
+        if (i + 1 < net_last_len) {
+            print_str(" ");
+        }
+    }
+    print_str("\n");
+}
+
+static void net_stats() {
+    print_str("Buffer: ");
+    print_dec(net_last_len);
+    print_str(" bytes\n");
+}
+
 static void copy_name(char* dst, const char* src, int max) {
     int i = 0;
     while (src[i] && i < max - 1) {
@@ -168,6 +265,8 @@ static void print_prompt() {
         print_str("files> ");
     } else if (shell_mode == SHELL_DIRS) {
         print_str("dirs> ");
+    } else if (shell_mode == SHELL_NET) {
+        print_str("net> ");
     } else {
         print_str("> ");
     }
@@ -637,6 +736,7 @@ void process_command(char* command) {
             print_str("  free <addr> [blocks] - Free memory blocks\n");
             print_str("  files - Enter files view\n");
             print_str("  dirs  - Enter folders view\n");
+            print_str("  net   - Enter network view\n");
         } else if (strcmp(cmd, "echo") == 0) {
             char* msg = skip_spaces(cursor);
             if (msg && *msg) {
@@ -702,6 +802,8 @@ void process_command(char* command) {
             shell_mode = SHELL_FILES;
         } else if (strcmp(cmd, "dirs") == 0) {
             shell_mode = SHELL_DIRS;
+        } else if (strcmp(cmd, "net") == 0) {
+            shell_mode = SHELL_NET;
         } else if (strcmp(cmd, "moshi") == 0) {
             print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
         } else if (cmd[0] != '\0') {
@@ -797,7 +899,7 @@ void process_command(char* command) {
             print_str(cmd);
             print_str("\n");
         }
-    } else {
+    } else if (shell_mode == SHELL_DIRS) {
         if (strcmp(cmd, "help") == 0) {
             print_str("Folders commands:\n");
             print_str("  help  - Display this message\n");
@@ -822,6 +924,32 @@ void process_command(char* command) {
             dir_cd(name);
         } else if (strcmp(cmd, "pwd") == 0) {
             dir_pwd();
+        } else if (cmd[0] != '\0') {
+            print_str("Unknown command: '");
+            print_str(cmd);
+            print_str("\n");
+        }
+    } else {
+        if (strcmp(cmd, "help") == 0) {
+            print_str("Network commands:\n");
+            print_str("  help  - Display this message\n");
+            print_str("  back  - Return to root\n");
+            print_str("  send <hex> - Send hex bytes\n");
+            print_str("  last - Show last payload\n");
+            print_str("  clear - Clear last payload\n");
+            print_str("  stats - Show buffer stats\n");
+        } else if (strcmp(cmd, "back") == 0) {
+            shell_mode = SHELL_ROOT;
+        } else if (strcmp(cmd, "send") == 0) {
+            char* payload = skip_spaces(cursor);
+            net_send_hex(payload);
+        } else if (strcmp(cmd, "last") == 0) {
+            net_print_last();
+        } else if (strcmp(cmd, "clear") == 0) {
+            net_clear();
+            print_str("Cleared.\n");
+        } else if (strcmp(cmd, "stats") == 0) {
+            net_stats();
         } else if (cmd[0] != '\0') {
             print_str("Unknown command: '");
             print_str(cmd);
