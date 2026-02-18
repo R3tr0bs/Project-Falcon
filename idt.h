@@ -15,6 +15,8 @@ void init_idt();
 void init_pic();
 void init_interrupts();
 
+extern volatile uint32_t timer_ticks;
+
 // Handlers called from Assembly
 void fault_handler(registers_t* regs);
 void timer_handler();

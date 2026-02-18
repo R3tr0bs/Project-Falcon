@@ -17,6 +17,9 @@ gcc $CFLAGS -c vga.c -o vga.o
 gcc $CFLAGS -c idt.c -o idt.o
 gcc $CFLAGS -c keyboard.c -o keyboard.o
 gcc $CFLAGS -c pmm.c -o pmm.o
+gcc $CFLAGS -c cmos.c -o cmos.o
+gcc $CFLAGS -c pci.c -o pci.o
+gcc $CFLAGS -c crypto.c -o crypto.o
 
 # Link everything together
-ld -m elf_i386 -T linker.ld -o falcon.bin boot.o kernel.o ports.o utils.o vga.o idt.o keyboard.o pmm.o
+ld -m elf_i386 -T linker.ld -o falcon.bin boot.o kernel.o ports.o utils.o vga.o idt.o keyboard.o pmm.o cmos.o pci.o crypto.o

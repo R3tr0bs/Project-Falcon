@@ -30,6 +30,8 @@ extern void isr4(); extern void isr5(); extern void isr6(); extern void isr7();
 extern void isr8(); extern void isr9(); extern void isr10(); extern void isr11();
 extern void isr12(); extern void isr13(); extern void isr14(); extern void isr15();
 
+volatile uint32_t timer_ticks = 0;
+
 void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].offset_low = base & 0xFFFF;
     idt[num].offset_high = (base >> 16) & 0xFFFF;
@@ -87,10 +89,9 @@ void fault_handler(registers_t* regs) {
 }
 
 void timer_handler() {
-    static uint32_t tick = 0;
-    tick++;
+    timer_ticks++;
 
-    if ((tick % 18) < 9) {
+    if ((timer_ticks % 18) < 9) {
         vga_buffer[VGA_WIDTH - 1] = make_vgaentry(3, make_color(12, 1));
     } else {
         vga_buffer[VGA_WIDTH - 1] = make_vgaentry(' ', make_color(0, 1));

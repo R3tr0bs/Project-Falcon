@@ -10,6 +10,89 @@
 #include "idt.h"
 #include "keyboard.h"
 #include "pmm.h"
+#include "cmos.h"
+#include "pci.h"
+#include "crypto.h"
+
+static void print_at_no_cursor(int x, int y, const char* str, uint8_t color) {
+    int idx = y * VGA_WIDTH + x;
+    while (*str && idx < VGA_WIDTH * VGA_HEIGHT) {
+        vga_buffer[idx++] = make_vgaentry(*str++, color);
+    }
+}
+
+static void print_dec_at_no_cursor(int x, int y, uint32_t n, uint8_t color) {
+    if (n == 0) {
+        print_at_no_cursor(x, y, "0", color);
+        return;
+    }
+    char buf[32];
+    int i = 0;
+    while (n > 0) {
+        buf[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+    for (int j = 0; j < i / 2; j++) {
+        char temp = buf[j];
+        buf[j] = buf[i - j - 1];
+        buf[i - j - 1] = temp;
+    }
+    buf[i] = '\0';
+    print_at_no_cursor(x, y, buf, color);
+}
+
+static void draw_status_bar() {
+    rtc_time_t time;
+    rtc_get_time(&time);
+    
+    uint32_t free_mem = pmm_get_free_blocks() * 4; // 4KB blocks -> KB
+    
+    uint8_t bar_color = make_color(0, 7); // Black text on Light Grey background
+    
+    // Clear line
+    for (int i = 0; i < VGA_WIDTH; i++) {
+        vga_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + i] = make_vgaentry(' ', bar_color);
+    }
+    
+    print_at_no_cursor(1, VGA_HEIGHT - 1, "FALCON OS", bar_color);
+    
+    print_at_no_cursor(15, VGA_HEIGHT - 1, "MEM: ", bar_color);
+    print_dec_at_no_cursor(20, VGA_HEIGHT - 1, free_mem, bar_color);
+    print_at_no_cursor(26, VGA_HEIGHT - 1, "KB", bar_color); // Adjust based on number length? 
+    // This is hard with fixed positions. I'll just put it at 30.
+    
+    print_at_no_cursor(40, VGA_HEIGHT - 1, "TIME: ", bar_color);
+    
+    // Format time manually
+    char time_buf[9];
+    time_buf[0] = (time.hours / 10) + '0';
+    time_buf[1] = (time.hours % 10) + '0';
+    time_buf[2] = ':';
+    time_buf[3] = (time.minutes / 10) + '0';
+    time_buf[4] = (time.minutes % 10) + '0';
+    time_buf[5] = ':';
+    time_buf[6] = (time.seconds / 10) + '0';
+    time_buf[7] = (time.seconds % 10) + '0';
+    time_buf[8] = '\0';
+    
+    print_at_no_cursor(46, VGA_HEIGHT - 1, time_buf, bar_color);
+    
+    print_at_no_cursor(60, VGA_HEIGHT - 1, "DATE: ", bar_color);
+    char date_buf[11];
+    date_buf[0] = (time.year / 1000) + '0';
+    date_buf[1] = ((time.year / 100) % 10) + '0';
+    date_buf[2] = ((time.year / 10) % 10) + '0';
+    date_buf[3] = (time.year % 10) + '0';
+    date_buf[4] = '-';
+    date_buf[5] = (time.month / 10) + '0';
+    date_buf[6] = (time.month % 10) + '0';
+    date_buf[7] = '-';
+    date_buf[8] = (time.day / 10) + '0';
+    date_buf[9] = (time.day % 10) + '0';
+    date_buf[10] = '\0';
+    
+    print_at_no_cursor(66, VGA_HEIGHT - 1, date_buf, bar_color);
+}
 
 // --- Multiboot Structures ---
 typedef struct multiboot_memory_map {
@@ -262,13 +345,13 @@ static void copy_name(char* dst, const char* src, int max) {
 
 static void print_prompt() {
     if (shell_mode == SHELL_FILES) {
-        print_str("files> ");
+        print_str("falcon:files> ");
     } else if (shell_mode == SHELL_DIRS) {
-        print_str("dirs> ");
+        print_str("falcon:dirs> ");
     } else if (shell_mode == SHELL_NET) {
-        print_str("net> ");
+        print_str("falcon:net> ");
     } else {
-        print_str("> ");
+        print_str("falcon> ");
     }
 }
 
@@ -715,6 +798,96 @@ void shutdown() {
     asm volatile("cli; hlt"); // Fallback: Halt CPU if shutdown fails
 }
 
+// Reboot system
+void reboot() {
+    print_str("Rebooting...\n");
+    uint8_t temp;
+    // clear keyboard buffer
+    do {
+        temp = inb(0x64);
+        if ((temp & 1) != 0) {
+            inb(0x60);
+        }
+    } while ((temp & 2) != 0);
+    outb(0x64, 0xFE);
+    asm volatile("hlt");
+}
+
+// Matrix Effect
+void matrix_effect() {
+    clear_screen();
+    uint8_t green = make_color(2, 0); // Green on Black
+    int cols[VGA_WIDTH];
+    for (int i = 0; i < VGA_WIDTH; i++) cols[i] = 0; // Initialize column lengths
+
+    // Run for approx 5 seconds (5 * 18 ticks = 90)
+    // Actually let's run until key press or a fixed duration.
+    // Since we don't have non-blocking key check easily exposed, let's just run for a while.
+    int iterations = 400; 
+    
+    // Simple Pseudo-Random Number Generator (Linear Congruential Generator)
+    uint32_t seed = timer_ticks;
+
+    while (iterations--) {
+        // Update seed
+        seed = seed * 1103515245 + 12345;
+        
+        // Pick a few columns to update
+        int updates = (seed % 5) + 1;
+        for (int u = 0; u < updates; u++) {
+            seed = seed * 1103515245 + 12345;
+            int x = seed % VGA_WIDTH;
+            
+            seed = seed * 1103515245 + 12345;
+            char c = (seed % 93) + 33; // Random printable char
+            
+            // Draw falling character
+            // We need to track Y for each column to make it look like a stream?
+            // Or just random dots? Matrix is streams.
+            // Let's do random rain for simplicity as we don't want to use too much memory for state.
+            
+            seed = seed * 1103515245 + 12345;
+            int y = seed % (VGA_HEIGHT - 1); // Don't touch status bar
+            
+            vga_buffer[y * VGA_WIDTH + x] = make_vgaentry(c, green);
+        }
+        
+        // Delay
+        for(volatile int i=0; i<100000; i++);
+    }
+    clear_screen();
+}
+
+// Secure Delete (Shred)
+void file_shred(const char* name) {
+    int idx = find_file_index(name, current_dir);
+    if (idx < 0) {
+        print_str("File not found.\n");
+        return;
+    }
+    ram_file_t* f = &ram_files[idx];
+    if (f->data && f->capacity) {
+        // Overwrite with 0s
+        memset(f->data, 0, f->capacity);
+        // Overwrite with 1s
+        memset(f->data, 0xFF, f->capacity);
+        // Overwrite with 0s again
+        memset(f->data, 0, f->capacity);
+        
+        pmm_free_blocks(f->data, f->capacity / PMM_BLOCK_SIZE);
+    }
+    f->used = 0;
+    f->name[0] = '\0';
+    f->dir_id = 0;
+    f->size = 0;
+    f->capacity = 0;
+    f->data = 0;
+    if (open_file == idx) {
+        open_file = -1;
+    }
+    print_str("File shredded securely.\n");
+}
+
 // Process command
 void process_command(char* command) {
     char* cursor = command;
@@ -730,6 +903,12 @@ void process_command(char* command) {
             print_str("  clear - Clear the terminal screen\n");
             print_str("  echo [text] - Print back the given text\n");
             print_str("  exit  - Shutdown the system\n");
+            print_str("  reboot - Reboot the system\n");
+            print_str("  time   - Show system time\n");
+            print_str("  pci    - List PCI devices\n");
+            print_str("  fetch  - Show system info\n");
+            print_str("  matrix - Enter the Matrix\n");
+            print_str("  about - About Project Falcon\n");
             print_str("  mmap  - Show memory map\n");
             print_str("  mem  - Show memory usage\n");
             print_str("  alloc [blocks] - Allocate memory blocks\n");
@@ -737,6 +916,7 @@ void process_command(char* command) {
             print_str("  files - Enter files view\n");
             print_str("  dirs  - Enter folders view\n");
             print_str("  net   - Enter network view\n");
+            print_str("  color <fg> <bg> - Set text color\n");
         } else if (strcmp(cmd, "echo") == 0) {
             char* msg = skip_spaces(cursor);
             if (msg && *msg) {
@@ -760,6 +940,30 @@ void process_command(char* command) {
             print_str("\n");
         } else if (strcmp(cmd, "exit") == 0) {
             shutdown();
+        } else if (strcmp(cmd, "reboot") == 0) {
+            reboot();
+        } else if (strcmp(cmd, "time") == 0) {
+            rtc_time_t t;
+            rtc_get_time(&t);
+            print_str("Current Time: ");
+            print_dec(t.hours); print_str(":");
+            print_dec(t.minutes); print_str(":");
+            print_dec(t.seconds); print_str("\n");
+            print_str("Date: ");
+            print_dec(t.year); print_str("-");
+            print_dec(t.month); print_str("-");
+            print_dec(t.day); print_str("\n");
+        } else if (strcmp(cmd, "pci") == 0) {
+            pci_check_all_buses();
+        } else if (strcmp(cmd, "fetch") == 0) {
+            print_str("       .---.\n");
+            print_str("      /     \\\n");
+            print_str("      | o o |  User: root\n");
+            print_str("      |  ^  |  OS: Project Falcon\n");
+            print_str("      | '-' |  Shell: Falcon Shell\n");
+            print_str("      `-----'  Uptime: "); print_dec(timer_ticks / 18); print_str("s\n");
+        } else if (strcmp(cmd, "matrix") == 0) {
+            matrix_effect();
         } else if (strcmp(cmd, "alloc") == 0) {
             char* arg = next_token(&cursor);
             uint32_t blocks = 1;
@@ -804,8 +1008,32 @@ void process_command(char* command) {
             shell_mode = SHELL_DIRS;
         } else if (strcmp(cmd, "net") == 0) {
             shell_mode = SHELL_NET;
+        } else if (strcmp(cmd, "color") == 0) {
+            char* fg_str = next_token(&cursor);
+            char* bg_str = next_token(&cursor);
+            uint32_t fg = 15;
+            uint32_t bg = 4;
+            if (fg_str && *fg_str) {
+                if (!parse_u32(fg_str, &fg) || fg > 15) {
+                    print_str("Invalid foreground color (0-15).\n");
+                    return;
+                }
+            }
+            if (bg_str && *bg_str) {
+                if (!parse_u32(bg_str, &bg) || bg > 15) {
+                    print_str("Invalid background color (0-15).\n");
+                    return;
+                }
+            }
+            set_color((uint8_t)fg, (uint8_t)bg);
+            clear_screen();
+            print_str("Color changed.\n");
         } else if (strcmp(cmd, "moshi") == 0) {
             print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
+        } else if (strcmp(cmd, "about") == 0) {
+            print_str("Project Falcon OS\n");
+            print_str("Created by AI Agents.\n");
+            print_str("Version 0.2\n");
         } else if (cmd[0] != '\0') {
             print_str("Unknown command: '");
             print_str(cmd);
@@ -822,6 +1050,9 @@ void process_command(char* command) {
             print_str("  write <text> - Write to open file\n");
             print_str("  cat <name> - Print file contents\n");
             print_str("  rm <name> - Delete file\n");
+            print_str("  shred <name> - Securely delete file\n");
+            print_str("  hash <text> - Calculate DJB2 hash\n");
+            print_str("  cipher <key> <text> - XOR encrypt/decrypt\n");
             print_str("  stat <name> - Show file details\n");
             print_str("  open <name> - Open file\n");
             print_str("  read - Read open file\n");
@@ -864,6 +1095,36 @@ void process_command(char* command) {
                 print_str("Missing filename.\n");
             } else {
                 file_rm(name);
+            }
+        } else if (strcmp(cmd, "shred") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Missing filename.\n");
+            } else {
+                file_shred(name);
+            }
+        } else if (strcmp(cmd, "hash") == 0) {
+            char* text = skip_spaces(cursor);
+            if (!text || !*text) {
+                print_str("Missing text.\n");
+            } else {
+                uint32_t hash = djb2_hash(text);
+                print_str("Hash: ");
+                print_hex(hash);
+                print_str("\n");
+            }
+        } else if (strcmp(cmd, "cipher") == 0) {
+            char* key = next_token(&cursor);
+            char* text = skip_spaces(cursor);
+            if (!key || !*key) {
+                print_str("Missing key.\n");
+            } else if (!text || !*text) {
+                print_str("Missing text.\n");
+            } else {
+                xor_cipher(text, key, strlen(text));
+                print_str("Result: ");
+                print_str(text);
+                print_str("\n");
             }
         } else if (strcmp(cmd, "stat") == 0) {
             char* name = next_token(&cursor);
@@ -1014,5 +1275,12 @@ void kmain(uint32_t magic, multiboot_info_t* mboot_ptr) {
     init_dirs();
     print_prompt();
 
-    for(;;);
+    uint32_t last_tick = 0;
+    for(;;) {
+        if (timer_ticks - last_tick >= 18) {
+            last_tick = timer_ticks;
+            draw_status_bar();
+        }
+        asm volatile("hlt");
+    }
 }

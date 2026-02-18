@@ -3,9 +3,18 @@
 volatile uint16_t* vga_buffer = (uint16_t*)0xB8000;
 int cursor_x = 0;
 int cursor_y = 0;
+uint8_t current_color = 0x4F; // Default: White on Red (wait, 15 is White, 4 is Red? No, 4 is Red, 15 is White)
+// In original code: make_color(15, 4) -> 15 (White) on 4 (Red) -> 0x4F.
+// Wait, make_color(fg, bg) is (bg << 4) | fg.
+// make_color(15, 4) = (4 << 4) | 15 = 0x4F.
+// Background 4 (Red), Foreground 15 (White).
 
 uint8_t make_color(uint8_t fg, uint8_t bg) {
     return (bg << 4) | fg;
+}
+
+void set_color(uint8_t fg, uint8_t bg) {
+    current_color = make_color(fg, bg);
 }
 
 uint16_t make_vgaentry(char c, uint8_t color) {
@@ -15,22 +24,22 @@ uint16_t make_vgaentry(char c, uint8_t color) {
 }
 
 void terminal_scroll() {
-    for (int y = 0; y < VGA_HEIGHT - 1; y++) {
+    for (int y = 0; y < VGA_HEIGHT - 2; y++) {
         for (int x = 0; x < VGA_WIDTH; x++) {
             vga_buffer[y * VGA_WIDTH + x] = vga_buffer[(y + 1) * VGA_WIDTH + x];
         }
     }
     for (int x = 0; x < VGA_WIDTH; x++) {
-        vga_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = make_vgaentry(' ', make_color(15, 4));
+        vga_buffer[(VGA_HEIGHT - 2) * VGA_WIDTH + x] = make_vgaentry(' ', current_color);
     }
 }
 
 void print_newline() {
     cursor_x = 0;
     cursor_y++;
-    if (cursor_y >= VGA_HEIGHT) {
+    if (cursor_y >= VGA_HEIGHT - 1) {
         terminal_scroll();
-        cursor_y = VGA_HEIGHT - 1;
+        cursor_y = VGA_HEIGHT - 2;
     }
 }
 
@@ -39,7 +48,7 @@ void print_str(const char* str) {
         if (str[i] == '\n') {
             print_newline();
         } else {
-            vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(str[i], make_color(15, 4));
+            vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(str[i], current_color);
             cursor_x++;
             if (cursor_x >= VGA_WIDTH) {
                 print_newline();
@@ -51,7 +60,7 @@ void print_str(const char* str) {
 void clear_screen() {
     for (int y = 0; y < VGA_HEIGHT; y++) {
         for (int x = 0; x < VGA_WIDTH; x++) {
-            vga_buffer[y * VGA_WIDTH + x] = make_vgaentry(' ', make_color(15, 4));
+            vga_buffer[y * VGA_WIDTH + x] = make_vgaentry(' ', current_color);
         }
     }
     cursor_x = 0;
