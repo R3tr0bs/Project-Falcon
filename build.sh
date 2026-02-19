@@ -20,6 +20,16 @@ gcc $CFLAGS -c pmm.c -o pmm.o
 gcc $CFLAGS -c cmos.c -o cmos.o
 gcc $CFLAGS -c pci.c -o pci.o
 gcc $CFLAGS -c crypto.c -o crypto.o
+gcc $CFLAGS -c cpu.c -o cpu.o
+gcc $CFLAGS -c rng.c -o rng.o
+gcc $CFLAGS -c heap.c -o heap.o
+gcc $CFLAGS -c task.c -o task.o
+gcc $CFLAGS -c fs.c -o fs.o
+gcc $CFLAGS -c net.c -o net.o
+gcc $CFLAGS -c gui.c -o gui.o
+gcc $CFLAGS -c gui_desktop.c -o gui_desktop.o
+gcc $CFLAGS -c mouse.c -o mouse.o
+gcc $CFLAGS -c sound.c -o sound.o
 
 # Link everything together
-ld -m elf_i386 -T linker.ld -o falcon.bin boot.o kernel.o ports.o utils.o vga.o idt.o keyboard.o pmm.o cmos.o pci.o crypto.o
+ld -m elf_i386 -T linker.ld -o falcon.bin boot.o kernel.o ports.o utils.o vga.o idt.o keyboard.o pmm.o cmos.o pci.o crypto.o cpu.o rng.o heap.o task.o fs.o net.o gui.o gui_desktop.o mouse.o sound.o

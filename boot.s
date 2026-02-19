@@ -32,10 +32,12 @@ extern kmain            ; The main C kernel entry point
 extern fault_handler    ; The C handler for all CPU exceptions
 extern timer_handler    ; The C handler for the timer (IRQ 0)
 extern keyboard_handler ; The C handler for the keyboard (IRQ 1)
+extern mouse_handler    ; The C handler for the mouse (IRQ 12)
 
 ; --- Make assembly functions visible to the C code ---
 global timer_wrapper
 global keyboard_wrapper
+global mouse_wrapper
 
 ; --- ISR Wrappers ---
 
@@ -117,6 +119,14 @@ keyboard_wrapper:
     pushad             ; Save registers
     cld                ; Clear direction flag
     call keyboard_handler ; Call the C handler
+    popad              ; Restore registers
+    iretd              ; Return from interrupt
+
+; Wrapper for IRQ 12 (Mouse)
+mouse_wrapper:
+    pushad             ; Save registers
+    cld                ; Clear direction flag
+    call mouse_handler ; Call the C handler
     popad              ; Restore registers
     iretd              ; Return from interrupt
 

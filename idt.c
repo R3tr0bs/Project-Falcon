@@ -25,6 +25,7 @@ struct idt_ptr_t idt_ptr;
 
 extern void timer_wrapper(void);
 extern void keyboard_wrapper(void);
+extern void mouse_wrapper(void);
 extern void isr0(); extern void isr1(); extern void isr2(); extern void isr3();
 extern void isr4(); extern void isr5(); extern void isr6(); extern void isr7();
 extern void isr8(); extern void isr9(); extern void isr10(); extern void isr11();
@@ -79,6 +80,7 @@ void init_interrupts() {
 
     idt_set_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);
     idt_set_gate(33, (uint32_t)keyboard_wrapper, 0x08, 0x8E);
+    idt_set_gate(44, (uint32_t)mouse_wrapper, 0x08, 0x8E); // IRQ12 for mouse
 }
 
 void fault_handler(registers_t* regs) {
@@ -98,4 +100,10 @@ void timer_handler() {
     }
 
     outb(PIC1_COMMAND, 0x20);
+}
+
+void mouse_handler() {
+    mouse_irq_handler();
+    outb(PIC1_COMMAND, 0x20);
+    outb(PIC2_COMMAND, 0x20);
 }

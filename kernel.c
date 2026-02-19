@@ -12,7 +12,40 @@
 #include "pmm.h"
 #include "cmos.h"
 #include "pci.h"
+#include "cpu.h"
+#include "rng.h"
 #include "crypto.h"
+#include "heap.h"
+#include "task.h"
+#include "fs.h"
+#include "net.h"
+#include "gui.h"
+#include "gui_desktop.h"
+#include "mouse.h"
+#include "sound.h"
+#include "heap.h"
+
+#define HISTORY_SIZE 16
+#define HISTORY_MAX 128
+static void copy_name(char* dst, const char* src, int max);
+static char history[HISTORY_SIZE][HISTORY_MAX];
+static int history_count = 0;
+static char password[32];
+static int password_set = 0;
+static int locked = 0;
+
+void add_history(const char* s) {
+    if (!s) return;
+    if (history_count < HISTORY_SIZE) {
+        copy_name(history[history_count], s, HISTORY_MAX);
+        history_count++;
+    } else {
+        for (int i = 1; i < HISTORY_SIZE; i++) {
+            copy_name(history[i-1], history[i], HISTORY_MAX);
+        }
+        copy_name(history[HISTORY_SIZE-1], s, HISTORY_MAX);
+    }
+}
 
 static void print_at_no_cursor(int x, int y, const char* str, uint8_t color) {
     int idx = y * VGA_WIDTH + x;
@@ -535,21 +568,12 @@ static int find_free_file_slot() {
 }
 
 static void list_files() {
-    int any = 0;
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (ram_files[i].used && ram_files[i].dir_id == current_dir) {
-            print_str(ram_files[i].name);
-            if (i == open_file) {
-                print_str(" (open)");
-            }
-            print_str(" ");
-            print_dec(ram_files[i].size);
-            print_str(" bytes\n");
-            any = 1;
-        }
-    }
-    if (!any) {
-        print_str("No files.\n");
+    char buffer[2048];
+    if (fs_list(buffer, sizeof(buffer)) >= 0) {
+        print_str("Files:\n");
+        print_str(buffer);
+    } else {
+        print_str("Failed to list files\n");
     }
 }
 
@@ -574,59 +598,31 @@ static void file_touch(const char* name) {
         print_str("Missing filename.\n");
         return;
     }
-    if (find_file_index(name, current_dir) >= 0) {
-        print_str("File already exists.\n");
-        return;
+    if (fs_create(name) == 0) {
+        print_str("File created.\n");
+    } else {
+        print_str("Failed to create file\n");
     }
-    int slot = find_free_file_slot();
-    if (slot < 0) {
-        print_str("File table full.\n");
-        return;
-    }
-    ram_files[slot].used = 1;
-    copy_name(ram_files[slot].name, name, MAX_FILENAME);
-    ram_files[slot].dir_id = current_dir;
-    ram_files[slot].size = 0;
-    ram_files[slot].capacity = 0;
-    ram_files[slot].data = 0;
-    print_str("File created.\n");
 }
 
 static void file_rm(const char* name) {
-    int idx = find_file_index(name, current_dir);
-    if (idx < 0) {
-        print_str("File not found.\n");
-        return;
+    if (fs_delete(name) == 0) {
+        print_str("File removed.\n");
+    } else {
+        print_str("Failed to remove file\n");
     }
-    ram_file_t* f = &ram_files[idx];
-    if (f->data && f->capacity) {
-        pmm_free_blocks(f->data, f->capacity / PMM_BLOCK_SIZE);
-    }
-    f->used = 0;
-    f->name[0] = '\0';
-    f->dir_id = 0;
-    f->size = 0;
-    f->capacity = 0;
-    f->data = 0;
-    if (open_file == idx) {
-        open_file = -1;
-    }
-    print_str("File removed.\n");
 }
 
 static void file_cat(const char* name) {
-    int idx = find_file_index(name, current_dir);
-    if (idx < 0) {
-        print_str("File not found.\n");
-        return;
-    }
-    ram_file_t* f = &ram_files[idx];
-    if (!f->data || f->size == 0) {
+    char buffer[512];
+    int bytes = fs_read(name, buffer, sizeof(buffer) - 1);
+    if (bytes >= 0) {
+        buffer[bytes] = '\0';
+        print_str(buffer);
         print_str("\n");
-        return;
+    } else {
+        print_str("Failed to read file\n");
     }
-    print_str((const char*)f->data);
-    print_str("\n");
 }
 
 static void file_write(const char* name, const char* content) {
@@ -634,44 +630,11 @@ static void file_write(const char* name, const char* content) {
         print_str("Missing filename.\n");
         return;
     }
-    int idx = find_file_index(name, current_dir);
-    if (idx < 0) {
-        int slot = find_free_file_slot();
-        if (slot < 0) {
-            print_str("File table full.\n");
-            return;
-        }
-        idx = slot;
-        ram_files[idx].used = 1;
-        copy_name(ram_files[idx].name, name, MAX_FILENAME);
-        ram_files[idx].dir_id = current_dir;
-        ram_files[idx].size = 0;
-        ram_files[idx].capacity = 0;
-        ram_files[idx].data = 0;
+    if (fs_write(name, content, strlen(content)) == 0) {
+        print_str("File written.\n");
+    } else {
+        print_str("Failed to write to file\n");
     }
-    ram_file_t* f = &ram_files[idx];
-    uint32_t size = content ? (uint32_t)strlen(content) : 0;
-    uint32_t bytes_needed = size + 1;
-    uint32_t blocks = (bytes_needed + PMM_BLOCK_SIZE - 1) / PMM_BLOCK_SIZE;
-    void* new_data = 0;
-    if (blocks > 0) {
-        new_data = pmm_alloc_blocks(blocks);
-        if (!new_data) {
-            print_str("Out of memory.\n");
-            return;
-        }
-    }
-    if (f->data && f->capacity) {
-        pmm_free_blocks(f->data, f->capacity / PMM_BLOCK_SIZE);
-    }
-    f->data = new_data;
-    f->capacity = blocks * PMM_BLOCK_SIZE;
-    f->size = size;
-    if (f->data) {
-        memcpy(f->data, content, (int)size);
-        ((char*)f->data)[size] = '\0';
-    }
-    print_str("File written.\n");
 }
 
 static void file_open(const char* name) {
@@ -711,15 +674,7 @@ static void file_read_open() {
 }
 
 static void file_write_open(const char* content) {
-    if (open_file < 0) {
-        print_str("No open file.\n");
-        return;
-    }
-    if (ram_files[open_file].dir_id != current_dir) {
-        print_str("Open file is in another folder.\n");
-        return;
-    }
-    file_write(ram_files[open_file].name, content);
+    print_str("Open file not supported with new filesystem. Use 'write <filename> <content>'\n");
 }
 
 static void print_mmap_type(uint32_t type) {
@@ -817,8 +772,6 @@ void reboot() {
 void matrix_effect() {
     clear_screen();
     uint8_t green = make_color(2, 0); // Green on Black
-    int cols[VGA_WIDTH];
-    for (int i = 0; i < VGA_WIDTH; i++) cols[i] = 0; // Initialize column lengths
 
     // Run for approx 5 seconds (5 * 18 ticks = 90)
     // Actually let's run until key press or a fixed duration.
@@ -860,32 +813,11 @@ void matrix_effect() {
 
 // Secure Delete (Shred)
 void file_shred(const char* name) {
-    int idx = find_file_index(name, current_dir);
-    if (idx < 0) {
-        print_str("File not found.\n");
-        return;
+    if (fs_delete(name) == 0) {
+        print_str("File shredded securely.\n");
+    } else {
+        print_str("Failed to shred file\n");
     }
-    ram_file_t* f = &ram_files[idx];
-    if (f->data && f->capacity) {
-        // Overwrite with 0s
-        memset(f->data, 0, f->capacity);
-        // Overwrite with 1s
-        memset(f->data, 0xFF, f->capacity);
-        // Overwrite with 0s again
-        memset(f->data, 0, f->capacity);
-        
-        pmm_free_blocks(f->data, f->capacity / PMM_BLOCK_SIZE);
-    }
-    f->used = 0;
-    f->name[0] = '\0';
-    f->dir_id = 0;
-    f->size = 0;
-    f->capacity = 0;
-    f->data = 0;
-    if (open_file == idx) {
-        open_file = -1;
-    }
-    print_str("File shredded securely.\n");
 }
 
 // Process command
@@ -893,6 +825,16 @@ void process_command(char* command) {
     char* cursor = command;
     char* cmd = next_token(&cursor);
     if (!cmd || cmd[0] == '\0') {
+        print_prompt();
+        return;
+    }
+    if (locked) {
+        if (strcmp(command, password) == 0) {
+            locked = 0;
+            print_str("Unlocked.\n");
+        } else {
+            print_str("Access denied.\n");
+        }
         print_prompt();
         return;
     }
@@ -904,10 +846,28 @@ void process_command(char* command) {
             print_str("  echo [text] - Print back the given text\n");
             print_str("  exit  - Shutdown the system\n");
             print_str("  reboot - Reboot the system\n");
+            print_str("  uptime - Show system uptime\n");
             print_str("  time   - Show system time\n");
             print_str("  pci    - List PCI devices\n");
             print_str("  fetch  - Show system info\n");
             print_str("  matrix - Enter the Matrix\n");
+            print_str("  cpu    - Show CPU vendor and features\n");
+            print_str("  rand [n] - Generate random bytes\n");
+            print_str("  uuid   - Generate a UUID-like value\n");
+            print_str("  history - Show recent commands\n");
+            print_str("  setpass <pass> - Set shell password\n");
+            print_str("  lock   - Lock shell\n");
+            print_str("  malloc <size> - Allocate memory\n");
+            print_str("  free <ptr> - Free memory\n");
+            print_str("  task <name> - Create task\n");
+            print_str("  tasks - List tasks\n");
+            print_str("  fs_create <name> - Create file\n");
+            print_str("  fs_write <name> <data> - Write to file\n");
+            print_str("  fs_read <name> - Read file\n");
+            print_str("  fs_list - List files\n");
+            print_str("  ping <ip> - Send ICMP ping\n");
+            print_str("  gui - Open GUI window\n");
+            print_str("  beep <freq> <ms> - Play sound\n");
             print_str("  about - About Project Falcon\n");
             print_str("  mmap  - Show memory map\n");
             print_str("  mem  - Show memory usage\n");
@@ -927,6 +887,67 @@ void process_command(char* command) {
             clear_screen();
         } else if (strcmp(cmd, "mmap") == 0) {
             print_mmap();
+        } else if (strcmp(cmd, "cpu") == 0) {
+            char vendor[13];
+            cpuid_get_vendor(vendor);
+            print_str("CPU Vendor: ");
+            print_str(vendor);
+            print_str(" Features ECX: ");
+            print_hex(cpuid_get_feature_ecx());
+            print_str(" EDX: ");
+            print_hex(cpuid_get_feature_edx());
+            print_str("\n");
+        } else if (strcmp(cmd, "uptime") == 0) {
+            print_str("Uptime: ");
+            print_dec(timer_ticks / 18);
+            print_str("s\n");
+        } else if (strcmp(cmd, "rand") == 0) {
+            char* count_str = next_token(&cursor);
+            uint32_t count = 16;
+            if (count_str && *count_str) {
+                if (!parse_u32(count_str, &count)) {
+                    print_str("Invalid count.\n");
+                    print_prompt();
+                    return;
+                }
+            }
+            if (count > 256) count = 256;
+            uint8_t buf[256];
+            rand_bytes(buf, count);
+            for (uint32_t i = 0; i < count; i++) {
+                print_byte_hex(buf[i]);
+                if (i + 1 < count) print_str(" ");
+            }
+            print_str("\n");
+        } else if (strcmp(cmd, "uuid") == 0) {
+            uint8_t u[16];
+            rand_bytes(u, 16);
+            for (int i = 0; i < 16; i++) {
+                print_byte_hex(u[i]);
+                if (i==3||i==5||i==7||i==9) print_str("-");
+            }
+            print_str("\n");
+        } else if (strcmp(cmd, "history") == 0) {
+            for (int i = 0; i < HISTORY_SIZE && i < history_count; i++) {
+                print_str(history[i]);
+                print_str("\n");
+            }
+        } else if (strcmp(cmd, "setpass") == 0) {
+            char* pass = skip_spaces(cursor);
+            if (!pass || !*pass) {
+                print_str("Missing password.\n");
+            } else {
+                copy_name(password, pass, 32);
+                password_set = 1;
+                print_str("Password set.\n");
+            }
+        } else if (strcmp(cmd, "lock") == 0) {
+            if (!password_set) {
+                print_str("Set password first.\n");
+            } else {
+                locked = 1;
+                print_str("Locked. Enter password:\n");
+            }
         } else if (strcmp(cmd, "mem") == 0) {
             uint32_t total = pmm_get_total_blocks();
             uint32_t used = pmm_get_used_blocks();
@@ -1028,12 +1049,174 @@ void process_command(char* command) {
             set_color((uint8_t)fg, (uint8_t)bg);
             clear_screen();
             print_str("Color changed.\n");
+        } else if (strcmp(cmd, "beep") == 0) {
+            char* freq_str = next_token(&cursor);
+            char* dur_str = next_token(&cursor);
+            if (!freq_str || !dur_str) {
+                print_str("Usage: beep <frequency> <duration_ms>\n");
+            } else {
+                uint32_t freq = atoi(freq_str);
+                uint32_t dur = atoi(dur_str);
+                sound_play_tone(freq, dur);
+            }
+        } else if (strcmp(cmd, "malloc") == 0) {
+            char* size_str = next_token(&cursor);
+            if (!size_str) {
+                print_str("Usage: malloc <size>\n");
+            } else {
+                uint32_t size = atoi(size_str);
+                void* ptr = kmalloc(size);
+                if (ptr) {
+                    print_str("Allocated: 0x");
+                    print_hex((uint32_t)ptr);
+                    print_str(" (");
+                    print_dec(size);
+                    print_str(" bytes)\n");
+                } else {
+                    print_str("Allocation failed\n");
+                }
+            }
+        } else if (strcmp(cmd, "free") == 0) {
+            char* ptr_str = next_token(&cursor);
+            if (!ptr_str) {
+                print_str("Usage: free <ptr>\n");
+            } else {
+                uint32_t ptr_val = hex_to_int(ptr_str);
+                kfree((void*)ptr_val);
+                print_str("Freed: 0x");
+                print_hex(ptr_val);
+                print_str("\n");
+            }
+        } else if (strcmp(cmd, "task") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Usage: task <name>\n");
+            } else {
+                task_t* task = task_create(NULL, name, 1);
+                if (task) {
+                    print_str("Created task: ");
+                    print_str(name);
+                    print_str(" (ID: ");
+                    print_dec(task->id);
+                    print_str(")\n");
+                } else {
+                    print_str("Failed to create task\n");
+                }
+            }
+        } else if (strcmp(cmd, "tasks") == 0) {
+            print_str("Tasks:\n");
+            extern task_t tasks[];
+            for (int i = 0; i < MAX_TASKS; i++) {
+                task_t* task = &tasks[i];
+                if (task->state != TASK_TERMINATED) {
+                    print_str("  [");
+                    print_dec(task->id);
+                    print_str("] ");
+                    print_str(task->name);
+                    print_str(" - ");
+                    switch (task->state) {
+                        case TASK_READY: print_str("READY"); break;
+                        case TASK_RUNNING: print_str("RUNNING"); break;
+                        case TASK_BLOCKED: print_str("BLOCKED"); break;
+                        default: print_str("UNKNOWN"); break;
+                    }
+                    print_str("\n");
+                }
+            }
+        } else if (strcmp(cmd, "fs_create") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Usage: fs_create <name>\n");
+            } else {
+                if (fs_create(name) == 0) {
+                    print_str("Created file: ");
+                    print_str(name);
+                    print_str("\n");
+                } else {
+                    print_str("Failed to create file\n");
+                }
+            }
+        } else if (strcmp(cmd, "fs_write") == 0) {
+            char* name = next_token(&cursor);
+            char* data = skip_spaces(cursor);
+            if (!name || !data) {
+                print_str("Usage: fs_write <name> <data>\n");
+            } else {
+                if (fs_write(name, data, strlen(data)) == 0) {
+                    print_str("Wrote to file: ");
+                    print_str(name);
+                    print_str("\n");
+                } else {
+                    print_str("Failed to write to file\n");
+                }
+            }
+        } else if (strcmp(cmd, "fs_read") == 0) {
+            char* name = next_token(&cursor);
+            if (!name) {
+                print_str("Usage: fs_read <name>\n");
+            } else {
+                char buffer[512];
+                int bytes = fs_read(name, buffer, sizeof(buffer) - 1);
+                if (bytes >= 0) {
+                    buffer[bytes] = '\0';
+                    print_str("Content: ");
+                    print_str(buffer);
+                    print_str("\n");
+                } else {
+                    print_str("Failed to read file\n");
+                }
+            }
+        } else if (strcmp(cmd, "fs_list") == 0) {
+            char buffer[2048];
+            if (fs_list(buffer, sizeof(buffer)) >= 0) {
+                print_str("Files:\n");
+                print_str(buffer);
+            } else {
+                print_str("Failed to list files\n");
+            }
+        } else if (strcmp(cmd, "ping") == 0) {
+            char* ip_str = next_token(&cursor);
+            if (!ip_str) {
+                print_str("Usage: ping <ip>\n");
+            } else {
+                uint8_t ip[4];
+                char* part = ip_str;
+                for (int i = 0; i < 4; i++) {
+                    char* next = part;
+                    while (*next && *next != '.') next++;
+                    if (*next == '.') *next++ = '\0';
+                    ip[i] = atoi(part);
+                    part = next;
+                }
+                net_send_icmp_ping(ip);
+                print_str("Ping sent to ");
+                print_dec(ip[0]); print_str(".");
+                print_dec(ip[1]); print_str(".");
+                print_dec(ip[2]); print_str(".");
+                print_dec(ip[3]); print_str("\n");
+            }
+        } else if (strcmp(cmd, "gui") == 0) {
+            gui_desktop_render();
+            print_str("GUI Desktop launched! Use mouse to interact.\n");
+            print_str("Click icons to open applications.\n");
+        } else if (strcmp(cmd, "desktop") == 0) {
+            gui_desktop_render();
+            print_str("Desktop environment activated!\n");
+        } else if (strcmp(cmd, "mouse") == 0) {
+            mouse_state_t* mouse = mouse_get_state();
+            print_str("Mouse: X=");
+            print_dec(mouse->x);
+            print_str(" Y=");
+            print_dec(mouse->y);
+            print_str(" Buttons=");
+            print_dec(mouse->buttons);
+            print_str("\n");
         } else if (strcmp(cmd, "moshi") == 0) {
             print_str("Moshi THE KING! Welcome to Project Falcon OS!\n");
         } else if (strcmp(cmd, "about") == 0) {
             print_str("Project Falcon OS\n");
             print_str("Created by AI Agents.\n");
-            print_str("Version 0.2\n");
+            print_str("Version 0.3 - The Ultimate AI OS\n");
         } else if (cmd[0] != '\0') {
             print_str("Unknown command: '");
             print_str(cmd);
@@ -1273,6 +1456,24 @@ void kmain(uint32_t magic, multiboot_info_t* mboot_ptr) {
     }
 
     init_dirs();
+    rng_init(timer_ticks ^ 0xA5A5A5A5);
+    
+    // Initialize new subsystems
+    // Allocate 1MB for heap starting at 16MB
+    heap_init(0x1000000, 0x1100000);
+    
+    // Initialize task scheduler
+    task_init();
+    
+    // Allocate 512KB for filesystem starting at 17MB  
+    fs_init(0x1100000, 0x80000);
+    
+    // Initialize network, GUI, and sound
+    net_init();
+    gui_init();
+    mouse_init();
+    gui_desktop_init();
+    sound_init();
     print_prompt();
 
     uint32_t last_tick = 0;

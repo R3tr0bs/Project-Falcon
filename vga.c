@@ -23,6 +23,29 @@ uint16_t make_vgaentry(char c, uint8_t color) {
     return c16 | (color16 << 8);
 }
 
+void put_char(char c) {
+    if (c == '\n') {
+        print_newline();
+    } else {
+        vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(c, current_color);
+        cursor_x++;
+        if (cursor_x >= VGA_WIDTH) {
+            print_newline();
+        }
+    }
+}
+
+void erase_last_char() {
+    if (cursor_x > 0) {
+        cursor_x--;
+        vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(' ', current_color);
+    } else if (cursor_y > 0) {
+        cursor_y--;
+        cursor_x = VGA_WIDTH - 1;
+        vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(' ', current_color);
+    }
+}
+
 void terminal_scroll() {
     for (int y = 0; y < VGA_HEIGHT - 2; y++) {
         for (int x = 0; x < VGA_WIDTH; x++) {

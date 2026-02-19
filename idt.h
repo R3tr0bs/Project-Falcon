@@ -20,5 +20,7 @@ extern volatile uint32_t timer_ticks;
 // Handlers called from Assembly
 void fault_handler(registers_t* regs);
 void timer_handler();
+void keyboard_handler();
+void mouse_handler();
 
 #endif

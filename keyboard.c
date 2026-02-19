@@ -11,6 +11,7 @@ int cmd_buffer_idx = 0;
 
 // Defined in kernel.c
 extern void process_command(char* command);
+extern void add_history(const char* command);
 
 unsigned char kbdus[128] =
 {
@@ -30,19 +31,17 @@ void keyboard_handler() {
         if (c == '\n') {
             print_newline();
             cmd_buffer[cmd_buffer_idx] = '\0';
+            add_history(cmd_buffer);
             process_command(cmd_buffer);
             cmd_buffer_idx = 0;
         } else if (c == '\b') {
             if (cmd_buffer_idx > 0) {
                 cmd_buffer_idx--;
-                if (cursor_x > 0) {
-                    cursor_x--;
-                    vga_buffer[cursor_y * VGA_WIDTH + cursor_x] = make_vgaentry(' ', make_color(15, 4));
-                }
+                erase_last_char();
             }
         } else if (c && cmd_buffer_idx < CMD_BUFFER_SIZE - 1) {
             cmd_buffer[cmd_buffer_idx++] = c;
-            vga_buffer[cursor_y * VGA_WIDTH + cursor_x++] = make_vgaentry(c, make_color(15, 4));
+            put_char(c);
         }
         if (cursor_x >= VGA_WIDTH) {
             print_newline();

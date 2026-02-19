@@ -45,3 +45,50 @@ void* memset(void* s, int c, int n) {
     }
     return s;
 }
+
+int atoi(const char* str) {
+    int result = 0;
+    int sign = 1;
+    int i = 0;
+    
+    // Handle negative numbers
+    if (str[0] == '-') {
+        sign = -1;
+        i++;
+    }
+    
+    // Process digits
+    while (str[i] >= '0' && str[i] <= '9') {
+        result = result * 10 + (str[i] - '0');
+        i++;
+    }
+    
+    return result * sign;
+}
+
+int hex_to_int(const char* str) {
+    int result = 0;
+    int i = 0;
+    
+    // Skip optional 0x prefix
+    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        i = 2;
+    }
+    
+    // Process hex digits
+    while (str[i]) {
+        result *= 16;
+        if (str[i] >= '0' && str[i] <= '9') {
+            result += str[i] - '0';
+        } else if (str[i] >= 'a' && str[i] <= 'f') {
+            result += str[i] - 'a' + 10;
+        } else if (str[i] >= 'A' && str[i] <= 'F') {
+            result += str[i] - 'A' + 10;
+        } else {
+            break; // Invalid character
+        }
+        i++;
+    }
+    
+    return result;
+}
